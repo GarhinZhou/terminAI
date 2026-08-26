@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="stylesheet" href="xterm.css">
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #1e1e1e; overflow: hidden; }
+  #terminal { width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<div id="terminal"></div>
+<script src="xterm.js"></script>
+<script src="addon-fit.js"></script>
+<script>
+(function () {
+  var term = new Terminal({
+    cursorBlink: true,
+    fontSize: 14,
+    fontFamily: 'monospace',
+    scrollback: 10000,
+    allowProposedApi: true,
+    theme: {
+      background: '#101012',
+      foreground: '#E2E2E2'
+    }
+  });
+  var fitAddon = new FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
+  term.open(document.getElementById('terminal'));
+  fitAddon.fit();
+
+  // Notify ArkTS about user input and size changes.
+  term.onData(function (data) {
+    if (window.ohosBridge) window.ohosBridge.onTermInput(data);
+  });
+  term.onResize(function (size) {
+    if (window.ohosBridge) window.ohosBridge.onTermResize(size.cols, size.rows);
+  });
+
+  // Rendered-screen signal for the activity detector. It is deliberately
+  // debounced and limited to the visible tail so animated ANSI frames do not
+  // flood the ArkTS bridge.
+  var snapshotTimer = 0;
+  term.onWriteParsed(function () {
+    if (snapshotTimer) clearTimeout(snapshotTimer);
+    snapshotTimer = setTimeout(function () {
+      try {
+        var buffer = term.buffer.active;
+        var end = buffer.baseY + buffer.cursorY;
+        var start = Math.max(0, end - 10);
+        var lines = [];
+        for (var row = start; row <= end; row++) {
+          var line = buffer.getLine(row);
+          if (line) lines.push(line.translateToString(true));
+        }
+        if (window.ohosBridge) window.ohosBridge.onTermSnapshot(lines.join('\n'));
+      } catch (e) {}
+    }, 220);
+  });
+
+  // Refit when the container size changes (window drag, sidebar toggle).
+  if (window.ResizeObserver) {
+    new ResizeObserver(function () {
+      try { fitAddon.fit(); } catch (e) {}
+    }).observe(document.getElementById('terminal'));
+  }
+
+  // API for ArkTS -> terminal
+  window.termWrite = function (data) { term.write(data); };
+  // Terminal color scheme presets ("default" follows dark/light app theme).
+  var SCHEMES = {
+    solarized: {
+      background: '#002b36', foreground: '#839496', cursor: '#93a1a1',
+      black: '#073642', red: '#dc322f', green: '#859900', yellow: '#b58900',
+      blue: '#268bd2', magenta: '#d33682', cyan: '#2aa198', white: '#eee8d5'
+    },
+    dracula: {
+      background: '#282a36', foreground: '#f8f8f2', cursor: '#f8f8f0',
+      black: '#000000', red: '#ff5555', green: '#50fa7b', yellow: '#f1fa8c',
+      blue: '#bd93f9', magenta: '#ff79c6', cyan: '#8be9fd', white: '#bfbfbf'
+    },
+    gruvbox: {
+      background: '#282828', foreground: '#ebdbb2', cursor: '#ebdbb2',
+      black: '#282828', red: '#cc241d', green: '#98971a', yellow: '#d79921',
+      blue: '#458588', magenta: '#b16286', cyan: '#689d6a', white: '#a89984'
+    },
+    lightpaper: {
+      background: '#ffffff', foreground: '#333333', cursor: '#333333',
+      black: '#333333', red: '#c5221f', green: '#2e7d32', yellow: '#b26a00',
+      blue: '#1a73e8', magenta: '#ad1457', cyan: '#00838f', white: '#888888'
+    }
+  };
+  // Apply runtime style: size, bold, dark(app theme), font, cursor, scheme.
+  // "default" scheme follows the app theme (dark/light); presets override.
+  window.termSetStyle = function (size, bold, dark, font, cursor, scheme, lineHeight) {
+    try {
+      term.options.fontSize = size;
+      term.options.fontWeight = bold ? 'bold' : 'normal';
+      // An empty value means "system monospace". Always assign it so switching
+      // back from a named font does not leave xterm.js on the previous family.
+      term.options.fontFamily = font || 'monospace';
+      if (lineHeight) term.options.lineHeight = lineHeight;
+      if (cursor) term.options.cursorStyle = cursor;
+      var sc = (scheme && SCHEMES[scheme]) ? SCHEMES[scheme]
+        : (dark ? { background: '#101012', foreground: '#E2E2E2' }
+                : { background: '#ffffff', foreground: '#333333' });
+      term.options.theme = sc;
+      document.documentElement.style.background = sc.background;
+      document.body.style.background = sc.background;
+      fitAddon.fit();
+    } catch (e) {}
+  };
+  window.termSetScrollback = function (lines) {
+    try { term.options.scrollback = lines; } catch (e) {}
+  };
+  window.termFitNow = function () {
+    try { fitAddon.fit(); return term.cols + ',' + term.rows; } catch (e) { return ''; }
+  };
+  window.termClear = function () { term.clear(); };
+  window.termFocus = function () { term.focus(); };
+  window.getTermSize = function () { return term.cols + ',' + term.rows; };
+})();
+</script>
+</body>
+</html>

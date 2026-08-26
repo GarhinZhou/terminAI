@@ -1,0 +1,6 @@
+{
+  "name": "libterminal.so",
+  "types": "./Index.d.ts",
+  "version": "1.0.0",
+  "description": "terminAI PTY session manager native module"
+}

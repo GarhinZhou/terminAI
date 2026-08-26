@@ -1,0 +1,6 @@
+{
+  "modelVersion": "6.0.2",
+  "description": "terminAI - local PTY terminal session manager for HarmonyOS PC",
+  "dependencies": {},
+  "devDependencies": {}
+}

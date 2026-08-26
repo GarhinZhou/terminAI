@@ -1,0 +1,10 @@
+{
+  "app": {
+    "bundleName": "org.demo.myapplication",
+    "vendor": "aicoding",
+    "versionCode": 1000000,
+    "versionName": "1.0.0",
+    "icon": "$media:terminai_icon_concept_white",
+    "label": "$string:app_name"
+  }
+}

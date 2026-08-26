@@ -1,0 +1,12 @@
+/oh_modules
+**/build
+/.hvigor
+.cxx
+/.clangd
+/.clang-format
+/.clang-tidy
+**/.test
+/.appanalyzer
+/.bitfun
+# 验证截图
+.terminai-check/

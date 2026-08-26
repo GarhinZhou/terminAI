@@ -1,0 +1,12 @@
+{
+  "string": [
+    { "name": "module_desc", "value": "terminAI 终端会话管理器" },
+    { "name": "EntryAbility_desc", "value": "本地 PTY 终端控制台" },
+    { "name": "EntryAbility_label", "value": "terminAI" },
+    { "name": "perm_custom_sandbox", "value": "用于访问 PTY 接口的自定义沙箱" },
+    { "name": "perm_store_persistent", "value": "保存应用的持久化设置" },
+    { "name": "perm_read_write_user_file", "value": "读取和写入用户文件" },
+    { "name": "perm_file_access_persist", "value": "持久访问文件" },
+    { "name": "perm_internet", "value": "允许终端命令访问网络" }
+  ]
+}
