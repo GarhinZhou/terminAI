@@ -54,7 +54,7 @@ export struct NewAgentDialog {
     const initialId = this.selectedDeviceId.length > 0 ? this.selectedDeviceId : LOCAL_DEVICE_ID;
     this.selectDevice(initialId, true);
     const pending = AppStorage.get<string>('pendingNewCwd');
-    if (pending !== undefined && pending.length > 0 && this.chosenDeviceTarget.length === 0) {
+    if (pending !== undefined && pending.length > 0) {
       this.cwd = pending;
       AppStorage.setOrCreate('pendingNewCwd', '');
     }

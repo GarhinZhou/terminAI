@@ -84,6 +84,9 @@ struct Index {
   @State sidebarCollapsed: boolean = false;
   @State sidebarWidth: number = 280;
   @State defaultCwd: string = DEFAULT_CWD;
+  @State private titleSidebarHovered: boolean = false;
+  @State private titleSidebarPressed: boolean = false;
+  @State private titleSidebarFocused: boolean = false;
   // Global style state mirrored in AppStorage so every view stays in sync.
   @StorageProp('fontSize') @Watch('onStyleChanged') fontSize: number = 14;
   @StorageProp('fontBold') @Watch('onStyleChanged') fontBold: boolean = false;
@@ -306,7 +309,6 @@ struct Index {
       }
       session.updateActivity(now);
     }
-    this.sessions = [...this.sessions];
   }
 
   private saveCustomAgents(value: string): void {
@@ -1134,9 +1136,77 @@ struct Index {
     return null;
   }
 
+  private titleSidebarBackground(): string {
+    if (this.titleSidebarPressed) {
+      return Theme.pressed(this.isDark);
+    }
+    if (this.titleSidebarHovered) {
+      return Theme.hover(this.isDark);
+    }
+    return '#00000000';
+  }
+
+  private showSidebar(): void {
+    this.getUIContext().animateTo({ duration: 200, curve: Curve.EaseOut },
+      () => { this.sidebarCollapsed = false; });
+  }
+
+  @Builder
+  titleSidebarButton() {
+    Row() {
+      UiIcon({
+        name: IconName.SidebarShow,
+        iconSize: 16,
+        color: Theme.subText(this.isDark)
+      })
+    }
+    .width(30)
+    .height(28)
+    .justifyContent(FlexAlign.Center)
+    .margin({ left: 8, right: 2 })
+    .backgroundColor(this.titleSidebarBackground())
+    .border({
+      width: this.titleSidebarFocused ? 2 : 0,
+      color: Theme.accent(this.isDark),
+      radius: 7
+    })
+    .borderRadius(7)
+    .scale({
+      x: this.titleSidebarPressed ? 0.96 : 1,
+      y: this.titleSidebarPressed ? 0.96 : 1
+    })
+    .focusable(true)
+    .focusOnTouch(true)
+    .onFocus(() => { this.titleSidebarFocused = true; })
+    .onBlur(() => { this.titleSidebarFocused = false; })
+    .onHover((isHover: boolean) => {
+      this.titleSidebarHovered = isHover;
+      if (!isHover) {
+        this.titleSidebarPressed = false;
+      }
+    })
+    .onMouse((event: MouseEvent) => {
+      if (event.button === MouseButton.Left) {
+        this.titleSidebarPressed = event.action === MouseAction.Press;
+      }
+    })
+    .onTouch((event: TouchEvent) => {
+      if (event.type === TouchType.Down) {
+        this.titleSidebarPressed = true;
+      } else if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
+        this.titleSidebarPressed = false;
+      }
+    })
+    .onClick(() => { this.showSidebar(); })
+    .accessibilityText('显示侧边栏')
+  }
+
   @Builder
   detailTitlebar() {
     Row() {
+      if (this.sidebarCollapsed) {
+        this.titleSidebarButton()
+      }
       Row() {
         if (this.currentSession() !== null) {
           if (this.currentSession()!.cmd.length === 0) {
@@ -1154,6 +1224,8 @@ struct Index {
             .fontWeight(FontWeight.Medium)
             .fontColor(Theme.text(this.isDark))
             .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .constraintSize({ maxWidth: 360 })
             .margin({ left: 7 })
           SessionNumberBadge({ value: this.currentSession()!.sequence, isDark: this.isDark })
             .margin({ left: 6 })
@@ -1176,7 +1248,7 @@ struct Index {
       }
       .height('100%')
       .layoutWeight(1)
-      .padding({ left: 16, right: 10 })
+      .padding({ left: this.sidebarCollapsed ? 6 : 16, right: 10 })
       .onTouch((event: TouchEvent) => {
         this.handleTitleTouch(event);
       })
@@ -1298,8 +1370,15 @@ struct Index {
             if (this.selectedDeviceId.length > 0) {
               this.selectDevice(deviceId);
             }
-            const idx = this.sessions.findIndex((it: TerminalSession) =>
-              it.deviceId === deviceId && canonicalSessionCwd(it) === cwd);
+            const inSpace = (it: TerminalSession): boolean =>
+              it.deviceId === deviceId && canonicalSessionCwd(it) === cwd;
+            // Prefer an agent session; a space often also holds the plain
+            // terminal that SSH auto-open created.
+            let idx = this.sessions.findIndex((it: TerminalSession) =>
+              inSpace(it) && it.cmd.length > 0);
+            if (idx < 0) {
+              idx = this.sessions.findIndex((it: TerminalSession) => inSpace(it));
+            }
             if (idx >= 0) {
               this.currentIdx = idx;
             }
@@ -1313,7 +1392,14 @@ struct Index {
           onNewSpace: () => { this.newSpaceCtrl.open(); },
           onSearch: () => { this.paletteCtrl.open(); },
           onCloseSession: (s: TerminalSession) => this.closeSession(s),
+          onSelectSession: (uid: number) => {
+            const idx = this.sessions.findIndex((it: TerminalSession) => it.uid === uid);
+            if (idx >= 0) {
+              this.currentIdx = idx;
+            }
+          },
           onRenameSession: (s: TerminalSession, name: string) => {
+            s.markManualTitle();
             s.name = this.capitalizeSessionName(name);
             this.sessions = [...this.sessions];
           },
@@ -1335,13 +1421,12 @@ struct Index {
             .strokeWidth(1)
 
           // Terminal stack: all sessions mounted, only current visible.
-          // BottomStart alignment anchors the expand button; other children
-          // are full-size so the alignment does not affect them.
-          Stack({ alignContent: Alignment.BottomStart }) {
+          Stack() {
             ForEach(this.sessions, (s: TerminalSession, idx: number) => {
               Column() {
                 TerminalView({
                   session: s,
+                  active: idx === this.currentIdx,
                   onEvent: (ev: SessionEvent) => this.mgr.dispatch(ev),
                   onShortcut: (keyCode: number, shift: boolean) => {
                     this.handleAppShortcut(keyCode, shift);
@@ -1364,29 +1449,6 @@ struct Index {
               .backgroundColor(Theme.terminalBg(this.isDark))
             }
 
-            // Toggle shown only while the sidebar is hidden: expands from the
-            // screen bottom-left corner.
-            if (this.sidebarCollapsed) {
-              Row() {
-                UiIcon({
-                  name: IconName.SidebarShow,
-                  iconSize: 17,
-                  color: Theme.subText(this.isDark)
-                })
-              }
-                .width(36)
-                .height(36)
-                .justifyContent(FlexAlign.Center)
-                .backgroundColor(Theme.button(this.isDark))
-                .border({ width: 1, color: Theme.border(this.isDark), radius: 10 })
-                .borderRadius(10)
-                .margin({ left: 14, bottom: 14 })
-                .onClick(() => {
-                  this.getUIContext().animateTo({ duration: 200, curve: Curve.EaseOut },
-                    () => { this.sidebarCollapsed = false; });
-                })
-                .accessibilityText('显示侧边栏')
-            }
           }
           .width('100%')
           .layoutWeight(1)

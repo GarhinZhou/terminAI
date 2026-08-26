@@ -16,6 +16,7 @@
 #include <map>
 #include <mutex>
 #include <poll.h>
+#include <signal.h>
 #include <pthread.h>
 #include <cctype>
 #include <sstream>
@@ -40,6 +41,7 @@
 namespace {
 
 constexpr int kReadChunk = 64 * 1024;
+constexpr size_t kTsfnQueueLimit = 64;
 constexpr const char* kFallbackHome = "/storage/Users/currentUser";
 
 std::string UserHomeDirectory() {
@@ -92,6 +94,9 @@ struct PtySession {
     napi_env env = nullptr;
     pthread_t readerThread{};
     pthread_t waiterThread{};
+    bool readerStarted = false;
+    bool waiterStarted = false;
+    bool closing = false;
     std::string cwd;   // last known working directory
     std::string startCwd;
     // Used only by the hidden SSH master session. It is never placed in a
@@ -142,11 +147,33 @@ void CallJs(napi_env env, napi_value jsCb, void* /*context*/, void* data) {
 
 void PushEvent(PtySession* s, const std::string& kind, const std::string& data, int exitCode) {
     if (s->tsfn == nullptr) return;
-    LOGI("push event session=%{public}d kind=%{public}s bytes=%{public}zu", s->id, kind.c_str(), data.size());
+    if (kind != kKindOutput) {
+        LOGI("push event session=%{public}d kind=%{public}s", s->id, kind.c_str());
+    }
     SessionEvent* ev = new SessionEvent{ s->id, kind, data, exitCode };
-    napi_status st = napi_call_threadsafe_function(s->tsfn, ev, napi_tsfn_blocking);
-    if (st != napi_ok) {
-        delete ev;
+    // A blocking TSFN call cannot be interrupted. If ArkUI destroys a session
+    // while this bounded queue is full, the UI thread waits for ReaderMain and
+    // ReaderMain waits for that same UI thread to drain the queue. Retry the
+    // nonblocking call instead so closing the session always breaks the wait.
+    for (;;) {
+        napi_status st = napi_call_threadsafe_function(s->tsfn, ev, napi_tsfn_nonblocking);
+        if (st == napi_ok) {
+            return;
+        }
+        if (st != napi_queue_full) {
+            delete ev;
+            return;
+        }
+        bool closing = false;
+        {
+            std::lock_guard<std::mutex> lk(g_mutex);
+            closing = s->closing;
+        }
+        if (closing) {
+            delete ev;
+            return;
+        }
+        usleep(1000);
     }
 }
 
@@ -158,7 +185,76 @@ std::string LowerAscii(const std::string& value) {
     return lower;
 }
 
-void HandleStoredSshPassword(PtySession* s, const std::string& output) {
+void AppendUtf8Replacement(std::string& output) {
+    output.append("\xEF\xBF\xBD", 3);
+}
+
+/**
+ * PTY reads are byte-oriented and can split one UTF-8 code point between two
+ * reads. N-API strings must be valid UTF-8, so preserve an incomplete suffix
+ * and replace genuinely invalid bytes without touching ANSI control bytes.
+ */
+std::string SanitizeUtf8Chunk(const char* bytes, size_t length,
+    std::string& incompleteTail, bool finalChunk) {
+    std::string input = incompleteTail;
+    if (bytes != nullptr && length > 0) {
+        input.append(bytes, length);
+    }
+    incompleteTail.clear();
+    std::string output;
+    output.reserve(input.size());
+    size_t index = 0;
+    while (index < input.size()) {
+        const unsigned char first = static_cast<unsigned char>(input[index]);
+        if (first <= 0x7F) {
+            output.push_back(input[index]);
+            index++;
+            continue;
+        }
+
+        size_t sequenceLength = 0;
+        if (first >= 0xC2 && first <= 0xDF) sequenceLength = 2;
+        else if (first >= 0xE0 && first <= 0xEF) sequenceLength = 3;
+        else if (first >= 0xF0 && first <= 0xF4) sequenceLength = 4;
+        else {
+            AppendUtf8Replacement(output);
+            index++;
+            continue;
+        }
+
+        if (index + sequenceLength > input.size()) {
+            if (finalChunk) AppendUtf8Replacement(output);
+            else incompleteTail.assign(input, index, input.size() - index);
+            break;
+        }
+
+        bool valid = true;
+        for (size_t offset = 1; offset < sequenceLength; ++offset) {
+            const unsigned char continuation = static_cast<unsigned char>(input[index + offset]);
+            if ((continuation & 0xC0) != 0x80) {
+                valid = false;
+                break;
+            }
+        }
+        if (valid && sequenceLength == 3) {
+            const unsigned char second = static_cast<unsigned char>(input[index + 1]);
+            valid = !((first == 0xE0 && second < 0xA0) || (first == 0xED && second > 0x9F));
+        } else if (valid && sequenceLength == 4) {
+            const unsigned char second = static_cast<unsigned char>(input[index + 1]);
+            valid = !((first == 0xF0 && second < 0x90) || (first == 0xF4 && second > 0x8F));
+        }
+        if (!valid) {
+            AppendUtf8Replacement(output);
+            index++;
+            continue;
+        }
+        output.append(input, index, sequenceLength);
+        index += sequenceLength;
+    }
+    return output;
+}
+
+void HandleStoredSshPassword(PtySession* s, int masterFd, const std::string& output) {
     if (s->authSecret.empty()) return;
     s->authTail += output;
     if (s->authTail.size() > 1024) {
@@ -177,14 +273,25 @@ void HandleStoredSshPassword(PtySession* s, const std::string& output) {
     size_t left = input.size();
     bool written = true;
     while (left > 0) {
-        ssize_t count = write(s->masterFd, cursor, left);
+        ssize_t count = write(masterFd, cursor, left);
+        if (count > 0) {
+            cursor += count;
+            left -= static_cast<size_t>(count);
+            continue;
+        }
         if (count < 0) {
             if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                struct pollfd pfd { masterFd, POLLOUT, 0 };
+                int result = poll(&pfd, 1, 100);
+                if (result > 0) continue;
+                if (result < 0 && errno == EINTR) continue;
+            }
             written = false;
             break;
         }
-        cursor += count;
-        left -= static_cast<size_t>(count);
+        written = false;
+        break;
     }
     s->authSecretSent = true;
     SecureErase(s->authSecret);
@@ -197,9 +304,11 @@ void HandleStoredSshPassword(PtySession* s, const std::string& output) {
 
 void* ReaderMain(void* arg) {
     PtySession* s = static_cast<PtySession*>(arg);
+    const int masterFd = s->masterFd;
     char buf[kReadChunk];
+    std::string utf8Tail;
     for (;;) {
-        struct pollfd pfd { s->masterFd, POLLIN, 0 };
+        struct pollfd pfd { masterFd, POLLIN, 0 };
         int pr = poll(&pfd, 1, 500);
         if (pr < 0) {
             if (errno == EINTR) continue;
@@ -212,52 +321,77 @@ void* ReaderMain(void* arg) {
             if (!s->alive) return nullptr;
             continue;
         }
-        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
-            // drain whatever remains, then stop
-            ssize_t n = read(s->masterFd, buf, sizeof(buf));
-            if (n > 0) {
-                const std::string output(buf, n);
-                HandleStoredSshPassword(s, output);
-                PushEvent(s, kKindOutput, output, -1);
+        bool reachedEnd = false;
+        if (pfd.revents & (POLLIN | POLLERR | POLLHUP)) {
+            // Drain every byte before reporting exit. POLLIN and POLLHUP are
+            // commonly delivered together; reading only once loses the final
+            // screen when a short-lived shell or SSH process terminates.
+            for (;;) {
+                ssize_t n = read(masterFd, buf, sizeof(buf));
+                if (n > 0) {
+                    const std::string rawOutput(buf, n);
+                    HandleStoredSshPassword(s, masterFd, rawOutput);
+                    const std::string output = SanitizeUtf8Chunk(
+                        buf, static_cast<size_t>(n), utf8Tail, false);
+                    if (!output.empty()) {
+                        PushEvent(s, kKindOutput, output, -1);
+                    }
+                    continue;
+                }
+                if (n == 0) {
+                    reachedEnd = true;
+                    break;
+                }
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                reachedEnd = true;
+                break;
             }
-            break;
-        }
-        if (pfd.revents & POLLIN) {
-            ssize_t n = read(s->masterFd, buf, sizeof(buf));
-            if (n > 0) {
-                const std::string output(buf, n);
-                HandleStoredSshPassword(s, output);
-                PushEvent(s, kKindOutput, output, -1);
-                // Track cwd changes (shell cd) by reading the child's /proc link.
+
+            // Track cwd changes (shell cd) after the output burst. Doing this
+            // once per poll wakeup avoids holding the global session mutex for
+            // every individual PTY read.
+            if (!reachedEnd && !(pfd.revents & (POLLERR | POLLHUP))) {
                 char linkBuf[1024] = {};
                 char procPath[64];
                 snprintf(procPath, sizeof(procPath), "/proc/%d/cwd", s->childPid);
                 ssize_t len = readlink(procPath, linkBuf, sizeof(linkBuf) - 1);
                 if (len > 0) {
                     linkBuf[len] = '\0';
-                    std::lock_guard<std::mutex> lk(g_mutex);
-                    // log first successful read to prove /proc works in sandbox
                     static bool loggedOnce = false;
                     if (!loggedOnce) {
                         loggedOnce = true;
                         LOGI("cwd read OK: %{public}s", linkBuf);
                     }
-                    if (s->cwd != linkBuf) {
-                        s->cwd = linkBuf;
+                    bool cwdChanged = false;
+                    {
+                        std::lock_guard<std::mutex> lk(g_mutex);
+                        if (s->cwd != linkBuf) {
+                            s->cwd = linkBuf;
+                            cwdChanged = true;
+                        }
+                    }
+                    if (cwdChanged) {
                         PushEvent(s, kKindCwd, linkBuf, -1);
                     }
-                } else {
-                    // log once per poll cycle is too noisy; log only first failure
-                    static bool warned = false;
-                    if (!warned) {
-                        warned = true;
-                        LOGI("cwd readlink failed errno=%{public}d", errno);
-                    }
                 }
-            } else if (n == 0 || (n < 0 && errno != EINTR && errno != EAGAIN)) {
-                break;
             }
         }
+        if (reachedEnd || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+            break;
+        }
+        if (pfd.revents & POLLIN) {
+            // The nonblocking drain above consumed all currently available
+            // data. Keep polling for the next output burst.
+            continue;
+        }
+        if (pfd.revents & POLLNVAL) {
+            break;
+        }
+    }
+    const std::string finalOutput = SanitizeUtf8Chunk(nullptr, 0, utf8Tail, true);
+    if (!finalOutput.empty()) {
+        PushEvent(s, kKindOutput, finalOutput, -1);
     }
     SecureErase(s->authSecret);
     return nullptr;
@@ -273,31 +407,58 @@ void* WaiterMain(void* arg) {
         else if (WIFSIGNALED(status)) code = 128 + WTERMSIG(status);
     }
     LOGI("session %{public}d child %{public}d exited code=%{public}d", s->id, s->childPid, code);
-    PushEvent(s, kKindExit, "", code);
+    // ReaderMain owns the ordering of PTY output. Wait until it has drained the
+    // slave side completely, then enqueue exit after every output event.
+    if (s->readerStarted) {
+        pthread_join(s->readerThread, nullptr);
+    }
+    bool shouldNotify = true;
+    {
+        std::lock_guard<std::mutex> lk(g_mutex);
+        s->alive = false;
+        shouldNotify = !s->closing;
+    }
+    if (shouldNotify) {
+        PushEvent(s, kKindExit, "", code);
+    }
     return nullptr;
 }
 
 // ── Session lifecycle ───────────────────────────────────────────────
 
-void DestroySessionLocked(PtySession* s) {
-    // caller holds g_mutex; session already removed from g_sessions.
-    // Order matters: waiter exits once the child is reaped (SIGHUP makes the
-    // shell die quickly); reader exits on closed fd or the alive flag.
-    s->alive = false;
+void DestroySession(PtySession* s) {
+    // The session has already been removed and marked dead under g_mutex.
+    // Never join while holding that mutex: reader/waiter callbacks may need it.
     if (s->childPid > 0) {
-        kill(-s->childPid, SIGHUP);  // process group
+        kill(-s->childPid, SIGHUP);
         kill(s->childPid, SIGHUP);
+        kill(-s->childPid, SIGTERM);
+        kill(s->childPid, SIGTERM);
     }
-    // Release the mutex while joining so PushEvent/reader can lock it.
-    g_mutex.unlock();
-    pthread_join(s->waiterThread, nullptr);
     if (s->masterFd >= 0) {
         close(s->masterFd);
         s->masterFd = -1;
     }
-    pthread_join(s->readerThread, nullptr);
-    g_mutex.lock();
 
+    // A shell or one of its descendants can ignore SIGHUP/SIGTERM. Bound the
+    // close path so killSession can never freeze the ArkUI thread forever.
+    if (s->childPid > 0) {
+        for (int attempt = 0; attempt < 10; ++attempt) {
+            if (kill(s->childPid, 0) != 0 && errno == ESRCH) break;
+            usleep(10 * 1000);
+        }
+        if (kill(s->childPid, 0) == 0) {
+            kill(-s->childPid, SIGKILL);
+            kill(s->childPid, SIGKILL);
+        }
+    }
+    if (s->waiterStarted) {
+        pthread_join(s->waiterThread, nullptr);
+        s->waiterStarted = false;
+    } else if (s->readerStarted) {
+        pthread_join(s->readerThread, nullptr);
+        s->readerStarted = false;
+    }
     if (s->tsfn != nullptr) {
         napi_release_threadsafe_function(s->tsfn, napi_tsfn_abort);
         s->tsfn = nullptr;
@@ -338,6 +499,8 @@ napi_value CreateSession(napi_env env, napi_callback_info info) {
     int32_t cols = 80, rows = 24;
     napi_get_value_int32(env, args[0], &cols);
     napi_get_value_int32(env, args[1], &rows);
+    if (cols < 2 || cols > 1000) cols = 80;
+    if (rows < 2 || rows > 1000) rows = 24;
 
     // args[2] is either the cwd string, or (if only 3 args) the callback;
     // args[3] is either the command string or (if 4 args) the callback.
@@ -374,7 +537,8 @@ napi_value CreateSession(napi_env env, napi_callback_info info) {
     napi_value resName;
     napi_create_string_utf8(env, "terminai_session", NAPI_AUTO_LENGTH, &resName);
     napi_status st = napi_create_threadsafe_function(
-        env, jsCallback, nullptr, resName, 0, 1, nullptr, nullptr, nullptr, CallJs, &s->tsfn);
+        env, jsCallback, nullptr, resName, kTsfnQueueLimit, 1,
+        nullptr, nullptr, nullptr, CallJs, &s->tsfn);
     if (st != napi_ok) {
         LOGE("create tsfn failed st=%d", st);
         napi_delete_reference(env, s->jsCallbackRef);
@@ -394,10 +558,42 @@ napi_value CreateSession(napi_env env, napi_callback_info info) {
         delete s;
         return nullptr;
     }
-    grantpt(master);
-    unlockpt(master);
+    if (grantpt(master) != 0 || unlockpt(master) != 0) {
+        const int setupError = errno;
+        LOGE("session create: grantpt/unlockpt failed errno=%{public}d", setupError);
+        close(master);
+        napi_release_threadsafe_function(s->tsfn, napi_tsfn_abort);
+        napi_delete_reference(env, s->jsCallbackRef);
+        delete s;
+        napi_throw_error(env, nullptr, "grantpt/unlockpt failed");
+        return nullptr;
+    }
     char slavePath[256] = {};
-    ptsname_r(master, slavePath, sizeof(slavePath));
+    if (ptsname_r(master, slavePath, sizeof(slavePath)) != 0 || slavePath[0] == '\0') {
+        const int setupError = errno;
+        LOGE("session create: ptsname_r failed errno=%{public}d", setupError);
+        close(master);
+        napi_release_threadsafe_function(s->tsfn, napi_tsfn_abort);
+        napi_delete_reference(env, s->jsCallbackRef);
+        delete s;
+        napi_throw_error(env, nullptr, "ptsname_r failed");
+        return nullptr;
+    }
+
+    // Keep the master nonblocking for its whole lifetime. Toggling O_NONBLOCK
+    // on dup(master) also changes the original open file description and races
+    // the reader/password writer.
+    const int masterFlags = fcntl(master, F_GETFL, 0);
+    if (masterFlags < 0 || fcntl(master, F_SETFL, masterFlags | O_NONBLOCK) != 0) {
+        const int setupError = errno;
+        LOGE("session create: fcntl O_NONBLOCK failed errno=%{public}d", setupError);
+        close(master);
+        napi_release_threadsafe_function(s->tsfn, napi_tsfn_abort);
+        napi_delete_reference(env, s->jsCallbackRef);
+        delete s;
+        napi_throw_error(env, nullptr, "configure PTY failed");
+        return nullptr;
+    }
 
     struct winsize ws { (unsigned short)rows, (unsigned short)cols, 0, 0 };
     ioctl(master, TIOCSWINSZ, &ws);
@@ -476,8 +672,35 @@ napi_value CreateSession(napi_env env, napi_callback_info info) {
         g_sessions[s->id] = s;
     }
 
-    pthread_create(&s->readerThread, nullptr, ReaderMain, s);
-    pthread_create(&s->waiterThread, nullptr, WaiterMain, s);
+    int threadResult = pthread_create(&s->readerThread, nullptr, ReaderMain, s);
+    if (threadResult == 0) {
+        s->readerStarted = true;
+        threadResult = pthread_create(&s->waiterThread, nullptr, WaiterMain, s);
+        s->waiterStarted = threadResult == 0;
+    }
+    if (!s->readerStarted || !s->waiterStarted) {
+        LOGE("session %{public}d thread creation failed result=%{public}d", s->id, threadResult);
+        {
+            std::lock_guard<std::mutex> lk(g_mutex);
+            s->closing = true;
+            s->alive = false;
+            g_sessions.erase(s->id);
+        }
+        kill(-child, SIGKILL);
+        kill(child, SIGKILL);
+        close(master);
+        s->masterFd = -1;
+        if (s->readerStarted) {
+            pthread_join(s->readerThread, nullptr);
+        }
+        int childStatus = 0;
+        waitpid(child, &childStatus, 0);
+        napi_release_threadsafe_function(s->tsfn, napi_tsfn_abort);
+        napi_delete_reference(env, s->jsCallbackRef);
+        delete s;
+        napi_throw_error(env, nullptr, "create terminal worker failed");
+        return nullptr;
+    }
 
     LOGI("session %d created pid=%d slave=%s %dx%d", s->id, child, slavePath, cols, rows);
 
@@ -496,24 +719,45 @@ napi_value WriteSession(napi_env env, napi_callback_info info) {
     napi_get_value_int32(env, args[0], &id);
     std::string data;
     ReadUtf8String(env, args[1], 1024 * 1024, data);
-    std::lock_guard<std::mutex> lk(g_mutex);
-    auto it = g_sessions.find(id);
-    bool ok = false;
-    if (it != g_sessions.end() && it->second->alive && it->second->masterFd >= 0) {
+    int writeFd = -1;
+    {
+        std::lock_guard<std::mutex> lk(g_mutex);
+        auto it = g_sessions.find(id);
+        if (it != g_sessions.end() && it->second->alive && it->second->masterFd >= 0) {
+            writeFd = dup(it->second->masterFd);
+        }
+    }
+    bool ok = writeFd >= 0;
+    if (ok) {
         const char* p = data.data();
         size_t left = data.size();
-        ok = true;
-        LOGI("write session=%{public}d bytes=%{public}zu", id, data.size());
-        while (left > 0) {
-            ssize_t n = write(it->second->masterFd, p, left);
-            if (n < 0) {
-                if (errno == EINTR) continue;
+        int waitCount = 0;
+        while (ok && left > 0) {
+            ssize_t n = write(writeFd, p, left);
+            if (n > 0) {
+                p += n;
+                left -= static_cast<size_t>(n);
+                waitCount = 0;
+                continue;
+            }
+            if (n == 0) {
                 ok = false;
                 break;
             }
-            p += n;
-            left -= n;
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    struct pollfd pfd { writeFd, POLLOUT, 0 };
+                    int result = poll(&pfd, 1, 25);
+                    if (result > 0) continue;
+                    if (result < 0 && errno == EINTR) continue;
+                    if (result == 0 && ++waitCount < 8) continue;
+                }
+                ok = false;
+                break;
+            }
         }
+        close(writeFd);
     }
     napi_value ret;
     napi_get_boolean(env, ok, &ret);
@@ -558,12 +802,13 @@ napi_value KillSession(napi_env env, napi_callback_info info) {
         auto it = g_sessions.find(id);
         if (it != g_sessions.end()) {
             victim = it->second;
+            victim->closing = true;
+            victim->alive = false;
             g_sessions.erase(it);
         }
     }
     if (victim != nullptr) {
-        std::lock_guard<std::mutex> lk(g_mutex);
-        DestroySessionLocked(victim);
+        DestroySession(victim);
         LOGI("session %d killed", id);
     }
     napi_value ret;
@@ -658,31 +903,62 @@ pid_t ProcessGroupOf(pid_t pid) {
     return ReadProcessRuntimeStats(pid, stats) ? stats.group : -1;
 }
 
+std::vector<pid_t> ProcessChildren(pid_t pid) {
+    char path[96];
+    snprintf(path, sizeof(path), "/proc/%d/task/%d/children", pid, pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return {};
+    char buffer[4096] = {};
+    ssize_t count = read(fd, buffer, sizeof(buffer) - 1);
+    close(fd);
+    std::vector<pid_t> children;
+    if (count <= 0) return children;
+    std::istringstream values(buffer);
+    pid_t child = -1;
+    while (values >> child) {
+        if (child > 0) children.push_back(child);
+    }
+    return children;
+}
+
 pid_t RepresentativeProcess(pid_t foregroundGroup, pid_t fallback) {
     if (foregroundGroup <= 0) return fallback;
     // In normal job-control sessions the process-group leader is the agent.
-    // Avoid scanning all of /proc on every 400 ms sample in that common case.
+    // Avoid inspecting any descendants in that common case.
     const std::string leaderCommand = ProcessCommand(foregroundGroup);
     if (!leaderCommand.empty() && !IsShellCommand(leaderCommand)) {
         return foregroundGroup;
     }
-    DIR* proc = opendir("/proc");
-    if (proc == nullptr) return fallback;
-    pid_t selected = fallback;
-    struct dirent* entry;
-    while ((entry = readdir(proc)) != nullptr) {
-        if (!std::isdigit(static_cast<unsigned char>(entry->d_name[0]))) continue;
-        pid_t pid = static_cast<pid_t>(atoi(entry->d_name));
-        if (ProcessGroupOf(pid) != foregroundGroup) continue;
-        std::string command = ProcessCommand(pid);
-        if (!command.empty() && !IsShellCommand(command)) {
-            selected = pid;
-            break;
+
+    // The app can reliably inspect its own descendants even without the
+    // system-only readproc group. Follow this session's process tree instead of
+    // scanning every process on the machine while the ArkUI thread waits.
+    std::vector<pid_t> pending;
+    std::vector<pid_t> visited;
+    pending.push_back(fallback);
+    size_t cursor = 0;
+    while (cursor < pending.size() && visited.size() < 128) {
+        const pid_t parent = pending[cursor++];
+        const std::vector<pid_t> children = ProcessChildren(parent);
+        for (pid_t child : children) {
+            bool alreadyVisited = false;
+            for (pid_t known : visited) {
+                if (known == child) {
+                    alreadyVisited = true;
+                    break;
+                }
+            }
+            if (alreadyVisited) continue;
+            visited.push_back(child);
+            pending.push_back(child);
+            if (ProcessGroupOf(child) != foregroundGroup) continue;
+            const std::string command = ProcessCommand(child);
+            if (!command.empty() && !IsShellCommand(command)) {
+                return child;
+            }
         }
-        if (selected <= 0) selected = pid;
     }
-    closedir(proc);
-    return selected;
+    return !leaderCommand.empty() ? foregroundGroup : fallback;
 }
 
 // ── NAPI: inspectSession(id) -> foreground process signal ──────────
@@ -696,6 +972,7 @@ napi_value InspectSession(napi_env env, napi_callback_info info) {
     bool alive = false;
     pid_t shellPid = -1;
     pid_t foregroundPid = -1;
+    int inspectFd = -1;
     std::string command;
     std::string processState;
     unsigned long long cpuTicks = 0;
@@ -706,14 +983,20 @@ napi_value InspectSession(napi_env env, napi_callback_info info) {
             PtySession* session = it->second;
             alive = session->alive;
             shellPid = session->childPid;
-            pid_t group = tcgetpgrp(session->masterFd);
-            foregroundPid = RepresentativeProcess(group, shellPid);
-            command = ProcessCommand(foregroundPid);
-            ProcessRuntimeStats stats;
-            if (ReadProcessRuntimeStats(foregroundPid, stats)) {
-                processState.assign(1, stats.state);
-                cpuTicks = stats.cpuTicks;
+            if (alive && session->masterFd >= 0) {
+                inspectFd = dup(session->masterFd);
             }
+        }
+    }
+    if (inspectFd >= 0) {
+        const pid_t group = tcgetpgrp(inspectFd);
+        close(inspectFd);
+        foregroundPid = RepresentativeProcess(group, shellPid);
+        command = ProcessCommand(foregroundPid);
+        ProcessRuntimeStats stats;
+        if (ReadProcessRuntimeStats(foregroundPid, stats)) {
+            processState.assign(1, stats.state);
+            cpuTicks = stats.cpuTicks;
         }
     }
 

@@ -1,6 +1,9 @@
 // Data model for one PTY terminal session.
 import libterminal from 'libterminal.so';
 
+const OUTPUT_HISTORY_LIMIT = 2 * 1024 * 1024;
+const OUTPUT_HISTORY_CHUNK_LIMIT = 64 * 1024;
+
 export interface SessionEvent {
   id: number;
   kind: string;      // "output" | "cwd" | "exit"
@@ -76,10 +79,16 @@ export class TerminalSession {
   private privateSignalTail: string = '';
   private observedAgentProcess: boolean = false;
   private explicitReturnedShell: boolean = false;
-  /** Output that arrived before the Web terminal page finished loading. */
-  pendingOutput: string[] = [];
-  /** Set by TerminalView once the xterm.js page is ready. */
-  termReady: boolean = false;
+  /** Bounded raw PTY history used to restore an ArkWeb page after hiding or reload. */
+  private outputHistoryChunks: string[] = [];
+  private outputHistoryLength: number = 0;
+  outputVersion: number = 0;
+  /** Guards asynchronous ArkWeb page callbacks from spawning duplicate native PTYs. */
+  startInProgress: boolean = false;
+  nativeStartCompleted: boolean = false;
+  disposed: boolean = false;
+  /** Explicit sidebar renames take precedence over agent-provided terminal titles. */
+  manualTitle: boolean = false;
   /** TerminalView → Index: called when this session wants attention. */
   onStateChanged: () => void = () => {};
   /** TerminalView → native bridge callbacks, wired by TerminalView. */
@@ -98,6 +107,89 @@ export class TerminalSession {
 
   isAgentSession(): boolean {
     return this.agentKind.length > 0;
+  }
+
+  markManualTitle(): void {
+    this.manualTitle = true;
+  }
+
+  /**
+   * herdrm displays the agent's stripped terminal title. xterm exposes the
+   * same OSC 0/2 title source, so use it when the CLI supplies a meaningful
+   * conversation title and the user has not explicitly renamed the session.
+   */
+  updateTerminalTitle(value: string): void {
+    if (!this.isAgentSession() || this.manualTitle) {
+      return;
+    }
+    let title = value
+      .replace(/\x1B\[[0-?]*[ -\/]*[@-~]/g, '')
+      .replace(/[\r\n\t]+/g, ' ')
+      .replace(/\s{2,}/g, ' ')
+      .trim();
+    if (title.length < 2) {
+      return;
+    }
+    const suffixes: string[] = [
+      ' — Claude Code', ' - Claude Code', ' — Codex', ' - Codex',
+      ' — Gemini', ' - Gemini', ' — Kimi', ' - Kimi'
+    ];
+    for (const suffix of suffixes) {
+      if (title.endsWith(suffix)) {
+        title = title.substring(0, title.length - suffix.length).trim();
+        break;
+      }
+    }
+    const lower = title.toLowerCase();
+    const agent = this.agentKind.toLowerCase();
+    const cwd = this.cwd.trim().toLowerCase();
+    const generic = lower === agent || lower === 'codex' || lower === 'claude' ||
+      lower === 'claude code' || lower === 'gemini' || lower === 'kimi' ||
+      lower === 'grok' || lower === 'terminal' || lower === 'zsh' ||
+      lower === 'bash' || lower === 'sh' || lower === 'fish' ||
+      lower === cwd || lower.startsWith('~/') || lower.startsWith('/') ||
+      /^[^ ]+@[^ ]+:[/~]/.test(title);
+    if (generic || title.length < 2) {
+      return;
+    }
+    if (title.length > 64) {
+      title = title.substring(0, 63) + '…';
+    }
+    if (this.name !== title) {
+      this.name = title;
+      this.onStateChanged();
+    }
+  }
+
+  private appendOutputHistory(data: string): void {
+    if (data.length === 0) {
+      return;
+    }
+    const lastIndex = this.outputHistoryChunks.length - 1;
+    if (lastIndex >= 0 &&
+      this.outputHistoryChunks[lastIndex].length + data.length <= OUTPUT_HISTORY_CHUNK_LIMIT) {
+      this.outputHistoryChunks[lastIndex] += data;
+    } else {
+      this.outputHistoryChunks.push(data);
+    }
+    this.outputHistoryLength += data.length;
+    while (this.outputHistoryLength > OUTPUT_HISTORY_LIMIT &&
+      this.outputHistoryChunks.length > 1) {
+      const removed = this.outputHistoryChunks[0];
+      this.outputHistoryChunks.splice(0, 1);
+      this.outputHistoryLength -= removed.length;
+    }
+    if (this.outputHistoryLength > OUTPUT_HISTORY_LIMIT &&
+      this.outputHistoryChunks.length === 1) {
+      const only = this.outputHistoryChunks[0];
+      this.outputHistoryChunks[0] = only.substring(only.length - OUTPUT_HISTORY_LIMIT);
+      this.outputHistoryLength = this.outputHistoryChunks[0].length;
+    }
+    this.outputVersion++;
+  }
+
+  outputHistoryText(): string {
+    return this.outputHistoryChunks.join('');
   }
 
   private setActivityState(next: AgentRunState): void {
@@ -303,7 +395,14 @@ export class TerminalSession {
   handleEvent(ev: SessionEvent): void {
     if (ev.kind === 'exit') {
       this.alive = false;
+      this.startInProgress = false;
       this.exitCode = ev.exitCode;
+      const exitNotice = ev.exitCode === 0 ?
+        '\r\n[terminAI] 会话已结束（退出码 0）\r\n' :
+        '\r\n[terminAI] 会话异常退出（退出码 ' + ev.exitCode.toString() +
+          '），请检查启动命令、工作目录或 SSH 连接。\r\n';
+      this.appendOutputHistory(exitNotice);
+      this.onOutput(exitNotice);
       this.activityState = this.isAgentSession() ? AgentRunState.Exited : this.activityState;
       this.onStateChanged();
       return;
@@ -322,6 +421,7 @@ export class TerminalSession {
       return;
     }
     if (ev.kind === 'output') {
+      this.appendOutputHistory(ev.data);
       this.trackPrivateSignals(ev.data);
       this.lastOutputAt = Date.now();
       const plain = this.stripTerminalControls(ev.data);
@@ -332,19 +432,7 @@ export class TerminalSession {
       if (this.isAgentSession() && plain.trim().length > 0 && !this.explicitReturnedShell) {
         this.setActivityState(AgentRunState.Outputting);
       }
-      if (this.termReady) {
-        this.onOutput(ev.data);
-      } else {
-        this.pendingOutput.push(ev.data);
-      }
-    }
-  }
-
-  flushPending(): void {
-    if (this.pendingOutput.length > 0) {
-      const joined = this.pendingOutput.join('');
-      this.pendingOutput = [];
-      this.onOutput(joined);
+      this.onOutput(ev.data);
     }
   }
 }
@@ -417,6 +505,8 @@ export class SessionManager {
   }
 
   remove(s: TerminalSession): void {
+    s.disposed = true;
+    s.startInProgress = false;
     if (s.id > 0) {
       try { libterminal.killSession(s.id); } catch (e) {}
     }
@@ -426,6 +516,8 @@ export class SessionManager {
 
   removeAll(): void {
     for (const s of this.sessions) {
+      s.disposed = true;
+      s.startInProgress = false;
       if (s.id > 0) {
         try { libterminal.killSession(s.id); } catch (e) {}
       }

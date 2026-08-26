@@ -4,7 +4,7 @@ import { Theme } from '../common/Theme';
 import { IconName, UiIcon } from '../common/Icons';
 import { BrandIcon } from '../common/BrandIcon';
 import { SessionNumberBadge } from '../common/SessionNumberBadge';
-import { ManagedDevice, decodeDevices } from '../model/ManagedDevice';
+import { ManagedDevice, decodeDevices, LOCAL_DEVICE_ID } from '../model/ManagedDevice';
 
 /** A space is represented by its working directory in the local-only port. */
 @Component
@@ -47,6 +47,8 @@ export struct SidebarView {
   onNewSpace: () => void = () => {};
   onSearch: () => void = () => {};
   onCloseSession: (s: TerminalSession) => void = () => {};
+  /** Selection by uid so Index resolves against its fresh session array. */
+  onSelectSession: (uid: number) => void = () => {};
   onRenameSession: (s: TerminalSession, name: string) => void = () => {};
   onOpenSettings: () => void = () => {};
   onOpenDevices: () => void = () => {};
@@ -56,7 +58,8 @@ export struct SidebarView {
   @State private renamingIdx: number = -1;
   @State private renameText: string = '';
   @State private selectedSpace: string = '';
-  @State private menuSession: TerminalSession | null = null;
+  /** Keep only a stable primitive in V1 state; resolve the row again when a menu action fires. */
+  @State private menuSessionUid: number = -1;
   @State private menuSpace: string = '';
   @State private menuSpaceDeviceId: string = 'local';
   @State private hoveredKey: string = '';
@@ -109,7 +112,8 @@ export struct SidebarView {
   }
 
   private isSessionSelected(item: TerminalSession): boolean {
-    return this.currentId === this.sessions.indexOf(item);
+    const idx = this.sessions.findIndex((s: TerminalSession) => s.uid === item.uid);
+    return this.currentId === idx;
   }
 
   private onFocusKey(key: string): void {
@@ -270,6 +274,17 @@ export struct SidebarView {
     return Theme.faintText(this.isDark);
   }
 
+  private deviceTagBackground(deviceId: string): string {
+    if (deviceId === LOCAL_DEVICE_ID) {
+      return this.isDark ? '#8062C987' : '#2B8650';
+    }
+    return this.isDark ? '#80E0B36A' : '#A96C25';
+  }
+
+  private deviceTagTextColor(): string {
+    return '#FFFFFF';
+  }
+
   private sessionSpaceKey(session: TerminalSession): string {
     return session.deviceId + '\t' + canonicalSessionCwd(session);
   }
@@ -301,24 +316,39 @@ export struct SidebarView {
     this.renameText = session.name;
   }
 
+  private menuSession(): TerminalSession | null {
+    const found = this.sessions.find((session: TerminalSession) => session.uid === this.menuSessionUid);
+    return found === undefined ? null : found;
+  }
+
+  private beginMenuFor(session: TerminalSession): void {
+    this.menuSessionUid = session.uid;
+  }
+
+  private clearSessionMenu(): void {
+    this.menuSessionUid = -1;
+  }
+
   private menuItems(): MenuElement[] {
     const items: MenuElement[] = [
       {
         value: '重命名',
         action: () => {
-          if (this.menuSession !== null) {
-            this.beginRename(this.menuSession);
+          const target = this.menuSession();
+          this.clearSessionMenu();
+          if (target !== null) {
+            this.beginRename(target);
           }
-          this.menuSession = null;
         }
       },
       {
         value: '关闭',
         action: () => {
-          if (this.menuSession !== null) {
-            this.onCloseSession(this.menuSession);
+          const target = this.menuSession();
+          this.clearSessionMenu();
+          if (target !== null) {
+            this.onCloseSession(target);
           }
-          this.menuSession = null;
         }
       }
     ];
@@ -330,17 +360,19 @@ export struct SidebarView {
     Menu() {
       MenuItem({ content: '重命名' })
         .onClick(() => {
-          if (this.menuSession !== null) {
-            this.beginRename(this.menuSession);
+          const target = this.menuSession();
+          this.clearSessionMenu();
+          if (target !== null) {
+            this.beginRename(target);
           }
-          this.menuSession = null;
         })
       MenuItem({ content: '关闭' })
         .onClick(() => {
-          if (this.menuSession !== null) {
-            this.onCloseSession(this.menuSession);
+          const target = this.menuSession();
+          this.clearSessionMenu();
+          if (target !== null) {
+            this.onCloseSession(target);
           }
-          this.menuSession = null;
         })
     }
   }
@@ -548,10 +580,11 @@ export struct SidebarView {
       if (this.selectedDeviceId.length === 0) {
         Text(space.deviceName)
           .fontSize(9.5)
-          .fontColor(Theme.tertiary(this.isDark))
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.deviceTagTextColor())
           .height(17)
           .padding({ left: 5, right: 5 })
-          .backgroundColor(Theme.input(this.isDark))
+          .backgroundColor(this.deviceTagBackground(space.deviceId))
           .borderRadius(5)
           .margin({ left: 6 })
       }
@@ -610,7 +643,7 @@ export struct SidebarView {
     .onHover((isHover: boolean) => { this.onHoverKey(this.sessionKey('more_', item), isHover); })
     .onMouse((event: MouseEvent) => { this.onMouseFeedback(this.sessionKey('more_', item), event); })
     .onTouch((event: TouchEvent) => { this.onTouchFeedback(this.sessionKey('more_', item), event); })
-    .onClick(() => { this.menuSession = item; })
+    .onClick(() => { this.beginMenuFor(item); })
     .bindMenu(this.menuItems())
     .accessibilityText('更多会话操作')
   }
@@ -683,10 +716,11 @@ export struct SidebarView {
           if (this.selectedDeviceId.length === 0) {
             Text(item.deviceName)
               .fontSize(9.5)
-              .fontColor(Theme.tertiary(this.isDark))
+              .fontWeight(FontWeight.Medium)
+              .fontColor(this.deviceTagTextColor())
               .height(18)
               .padding({ left: 5, right: 5 })
-              .backgroundColor(Theme.input(this.isDark))
+              .backgroundColor(this.deviceTagBackground(item.deviceId))
               .borderRadius(5)
               .margin({ left: 4 })
           }
@@ -716,11 +750,11 @@ export struct SidebarView {
     .onMouse((event: MouseEvent) => {
       this.onMouseFeedback(this.sessionKey('agent_', item), event);
       if (event.button === MouseButton.Right && event.action === MouseAction.Press) {
-        this.menuSession = item;
+        this.beginMenuFor(item);
       }
     })
     .onTouch((event: TouchEvent) => { this.onTouchFeedback(this.sessionKey('agent_', item), event); })
-    .onClick(() => { this.currentId = this.sessions.indexOf(item); })
+    .onClick(() => { this.onSelectSession(item.uid); })
     .bindContextMenu(this.contextMenuBuilder, ResponseType.RightClick)
     .accessibilityText(item.name + ' ' + item.sequence.toString() + '，' +
       this.programLabel(item) + '，空间 ' +
@@ -750,10 +784,11 @@ export struct SidebarView {
       if (this.selectedDeviceId.length === 0) {
         Text(item.deviceName)
           .fontSize(9.5)
-          .fontColor(Theme.tertiary(this.isDark))
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.deviceTagTextColor())
           .height(18)
           .padding({ left: 5, right: 5 })
-          .backgroundColor(Theme.input(this.isDark))
+          .backgroundColor(this.deviceTagBackground(item.deviceId))
           .borderRadius(5)
           .margin({ right: 4 })
       }
@@ -777,11 +812,11 @@ export struct SidebarView {
     .onMouse((event: MouseEvent) => {
       this.onMouseFeedback(this.sessionKey('shell_', item), event);
       if (event.button === MouseButton.Right && event.action === MouseAction.Press) {
-        this.menuSession = item;
+        this.beginMenuFor(item);
       }
     })
     .onTouch((event: TouchEvent) => { this.onTouchFeedback(this.sessionKey('shell_', item), event); })
-    .onClick(() => { this.currentId = this.sessions.indexOf(item); })
+    .onClick(() => { this.onSelectSession(item.uid); })
     .bindContextMenu(this.contextMenuBuilder, ResponseType.RightClick)
     .accessibilityText('终端 ' + item.name + ' ' + item.sequence.toString())
     .accessibilitySelected(this.isSessionSelected(item))
@@ -857,17 +892,17 @@ export struct SidebarView {
       Row() {
         Row() {
           Image($r('app.media.terminai_icon_concept_white'))
-            .width(18)
-            .height(18)
+            .width(24)
+            .height(24)
             .objectFit(ImageFit.Contain)
-            .borderRadius(4)
+            .borderRadius(6)
             .clip(true)
             .accessibilityLevel('no')
           Text('terminAI')
-            .fontSize(13)
+            .fontSize(16)
             .fontWeight(FontWeight.Medium)
-            .fontColor(Theme.tertiary(this.isDark))
-            .margin({ left: 7 })
+            .fontColor(Theme.subText(this.isDark))
+            .margin({ left: 8 })
           Blank()
         }
         .height('100%')
@@ -900,8 +935,8 @@ export struct SidebarView {
         .accessibilityText('隐藏侧边栏')
       }
       .width('100%')
-      .height(40)
-      .padding({ left: 12, right: 10 })
+      .height(52)
+      .padding({ left: 14, right: 10 })
 
       Column({ space: 2 }) {
         this.actionRow(IconName.NewAgent, 'new_agent', '新建智能体', 'Ctrl + N',
@@ -910,7 +945,7 @@ export struct SidebarView {
           () => { this.onSearch(); })
       }
       .width('100%')
-      .padding({ left: 10, right: 10, top: 4, bottom: 6 })
+      .padding({ left: 10, right: 10, top: 0, bottom: 6 })
 
       List() {
         ListItem() {

@@ -31,13 +31,144 @@
   term.open(document.getElementById('terminal'));
   fitAddon.fit();
 
+  // Replaying raw PTY history can contain terminal capability/color queries.
+  // xterm answers those queries through onData; forwarding the answers to a
+  // shell would make them appear as typed garbage. Suppress only replay-side
+  // answers and hold live PTY writes until parsing the replay has completed.
+  var replayingHistory = false;
+  var replayGeneration = 0;
+  var replayPendingWrites = 0;
+  var replayEndRequested = false;
+  var writesAfterReplay = [];
+  var outputPort = null;
+
+  function isReplayGeneratedResponse(data) {
+    if (!data || data.charAt(0) !== '\x1b') return false;
+    return data.indexOf('rgb:') >= 0 || data.indexOf('$y') >= 0 ||
+      /^\x1b\[(\?|>)[0-9;]*c$/.test(data) ||
+      /^\x1b\[\??[0-9;]*R$/.test(data) ||
+      /^\x1b\[[0-9;]*n$/.test(data) ||
+      /^\x1bP[01][+$]r/.test(data);
+  }
+
+  function acknowledgePortWrite(token) {
+    if (outputPort) {
+      try { outputPort.postMessage('A' + token); } catch (e) {}
+    }
+  }
+
+  function writeQueuedItem(item) {
+    if (!item || !item.data) {
+      if (item && item.acknowledgement) acknowledgePortWrite(item.acknowledgement);
+      return;
+    }
+    if (item.acknowledgement) {
+      term.write(item.data, function () { acknowledgePortWrite(item.acknowledgement); });
+    } else {
+      term.write(item.data);
+    }
+  }
+
+  function writeAfterReplay(data, acknowledgement) {
+    if (!data) return;
+    if (replayingHistory) {
+      writesAfterReplay.push({ data: data, acknowledgement: acknowledgement || '' });
+      return;
+    }
+    writeQueuedItem({ data: data, acknowledgement: acknowledgement || '' });
+  }
+
+  function finishHistoryReplay(generation) {
+    if (generation !== replayGeneration || !replayEndRequested || replayPendingWrites > 0) return;
+    replayingHistory = false;
+    replayEndRequested = false;
+    var queued = writesAfterReplay;
+    writesAfterReplay = [];
+    for (var i = 0; i < queued.length; i++) {
+      writeQueuedItem(queued[i]);
+    }
+    if (outputPort) {
+      try { outputPort.postMessage('H'); } catch (e) {}
+    }
+  }
+
+  function beginHistoryReplay() {
+    replayGeneration++;
+    replayingHistory = true;
+    replayPendingWrites = 0;
+    replayEndRequested = false;
+    writesAfterReplay = [];
+    term.reset();
+  }
+
+  function writeHistoryReplayChunk(data) {
+    if (!replayingHistory || !data) return;
+    var generation = replayGeneration;
+    replayPendingWrites++;
+    try {
+      term.write(data, function () {
+        if (generation !== replayGeneration) return;
+        replayPendingWrites--;
+        finishHistoryReplay(generation);
+      });
+    } catch (e) {
+      if (generation === replayGeneration) {
+        replayPendingWrites--;
+        finishHistoryReplay(generation);
+      }
+    }
+  }
+
+  function endHistoryReplay() {
+    if (!replayingHistory) return;
+    replayEndRequested = true;
+    finishHistoryReplay(replayGeneration);
+  }
+
+  // PTY output is a continuous stream, so use a transferred MessagePort
+  // instead of evaluating one JavaScript source string for every output burst.
+  window.addEventListener('message', function (event) {
+    if (event.data !== '__terminai_output_port__' || !event.ports || !event.ports[0]) return;
+    outputPort = event.ports[0];
+    outputPort.onmessage = function (messageEvent) {
+      var message = messageEvent.data;
+      if (typeof message !== 'string' || message.length === 0) return;
+      var kind = message.charAt(0);
+      var payload = message.substring(1);
+      if (kind === 'D') {
+        var separator = payload.indexOf('\n');
+        if (separator > 0) {
+          writeAfterReplay(payload.substring(separator + 1), payload.substring(0, separator));
+        }
+      } else if (kind === 'B') {
+        beginHistoryReplay();
+      } else if (kind === 'R') {
+        writeHistoryReplayChunk(payload);
+      } else if (kind === 'E') {
+        endHistoryReplay();
+      }
+    };
+    outputPort.onmessageerror = function () {
+      console.error('terminAI terminal output port message error');
+    };
+    try { outputPort.postMessage('P'); } catch (e) {}
+  });
+
   // Notify ArkTS about user input and size changes.
   term.onData(function (data) {
+    if (replayingHistory && isReplayGeneratedResponse(data)) return;
     if (window.ohosBridge) window.ohosBridge.onTermInput(data);
   });
   term.onResize(function (size) {
     if (window.ohosBridge) window.ohosBridge.onTermResize(size.cols, size.rows);
   });
+  if (term.onTitleChange) {
+    term.onTitleChange(function (title) {
+      if (window.ohosBridge && title) {
+        window.ohosBridge.onTermTitle(title);
+      }
+    });
+  }
 
   // Rendered-screen signal for the activity detector. It is deliberately
   // debounced and limited to the visible tail so animated ANSI frames do not
@@ -68,7 +199,18 @@
   }
 
   // API for ArkTS -> terminal
-  window.termWrite = function (data) { term.write(data); };
+  window.termWrite = function (data) { writeAfterReplay(data, ''); };
+  window.termReplay = function (data) {
+    try {
+      beginHistoryReplay();
+      writeHistoryReplayChunk(data);
+      endHistoryReplay();
+    } catch (e) {
+      replayEndRequested = true;
+      replayPendingWrites = 0;
+      finishHistoryReplay(replayGeneration);
+    }
+  };
   // Terminal color scheme presets ("default" follows dark/light app theme).
   var SCHEMES = {
     solarized: {
