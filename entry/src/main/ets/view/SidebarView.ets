@@ -42,6 +42,7 @@ export struct SidebarView {
   @Link currentId: number;
   onNewAgent: () => void = () => {};
   onNewAgentIn: (cwd: string, deviceId: string) => void = () => {};
+  onSelectSpace: (deviceId: string, cwd: string) => void = () => {};
   onCloseSpace: (cwd: string, deviceId: string) => void = () => {};
   onNewSpace: () => void = () => {};
   onSearch: () => void = () => {};
@@ -578,6 +579,7 @@ export struct SidebarView {
     .onClick(() => {
       this.selectedSpace = space.key();
       AppStorage.setOrCreate('selectedSpace', space.key());
+      this.onSelectSpace(space.deviceId, space.cwd);
     })
     .bindContextMenu(this.spaceMenuBuilder, ResponseType.RightClick)
     .accessibilityGroup(true)

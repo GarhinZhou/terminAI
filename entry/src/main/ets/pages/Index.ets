@@ -1292,6 +1292,14 @@ struct Index {
             AppStorage.setOrCreate('pendingNewCwd', cwd);
             this.newDialogCtrl.open();
           },
+          onSelectSpace: (deviceId: string, cwd: string) => {
+            this.selectDevice(deviceId);
+            const idx = this.sessions.findIndex((it: TerminalSession) =>
+              it.deviceId === deviceId && canonicalSessionCwd(it) === cwd);
+            if (idx >= 0) {
+              this.currentIdx = idx;
+            }
+          },
           onCloseSpace: (cwd: string, deviceId: string) => {
             for (const s of this.sessions.filter((it: TerminalSession) =>
               canonicalSessionCwd(it) === cwd && it.deviceId === deviceId)) {

@@ -333,7 +333,8 @@ export struct NewAgentDialog {
           .margin({ top: 8, bottom: 8 })
 
         Row() {
-          TextInput({ text: this.cwd })
+          TextInput({ text: this.cwd,
+            placeholder: this.chosenDeviceTarget.length > 0 ? '远端绝对路径，如 /home/user/project' : '' })
             .fontSize(16)
             .height(40)
             .layoutWeight(1)
@@ -362,6 +363,14 @@ export struct NewAgentDialog {
           }
         }
         .width('100%')
+
+        if (this.chosenDeviceTarget.length > 0) {
+          Text('直接输入远端主机上的绝对路径（例如 /home/user/project），`~` 表示远端家目录。')
+            .fontSize(12)
+            .fontColor(Theme.tertiary(this.isDark))
+            .width('100%')
+            .margin({ top: 6 })
+        }
 
         // Recent spaces as quick picks
         if (this.chosenDeviceTarget.length === 0 && this.spaces().length > 0) {
