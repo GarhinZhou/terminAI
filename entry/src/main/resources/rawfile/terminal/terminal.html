@@ -151,36 +151,9 @@
   function pasteClipboard() {
     if (navigator.clipboard && navigator.clipboard.readText) {
       navigator.clipboard.readText().then(function (t) {
-        if (t) { term.paste(t); }
-        else { execPasteFallback(); }
-      }).catch(function () { execPasteFallback(); });
-    } else {
-      execPasteFallback();
+        if (t) term.paste(t);
+      }).catch(function () {});
     }
-  }
-
-  // Non-secure-context (rawfile://) fallback: focus a hidden contentEditable
-  // and let the system paste into it, then forward the text to xterm.js.
-  function execPasteFallback() {
-    try {
-      var target = document.getElementById('pasteTarget');
-      if (!target) {
-        target = document.createElement('div');
-        target.id = 'pasteTarget';
-        target.setAttribute('contenteditable', 'true');
-        target.style.position = 'fixed';
-        target.style.left = '-9999px';
-        target.style.top = '0';
-        document.body.appendChild(target);
-      }
-      target.focus();
-      document.execCommand('paste');
-      var text = target.innerText || target.textContent || '';
-      target.innerHTML = '';
-      target.blur();
-      if (text) term.paste(text);
-      term.focus();
-    } catch (e) {}
   }
 
   // Keyboard: Ctrl+C copies only when there is a selection (otherwise the PTY
