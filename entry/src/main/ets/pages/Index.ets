@@ -120,8 +120,9 @@ struct Index {
   // Standard modal dialogs.
   private newDialogCtrl: CustomDialogController = new CustomDialogController({
     builder: NewAgentDialog({
-      onConfirm: (cwd: string, cmd: string, label: string, iconKind: string) => {
-        const device = this.activeDevice();
+      onConfirm: (cwd: string, cmd: string, label: string, iconKind: string, deviceId: string) => {
+        const device = decodeDevices(this.devicesEncoded).find((item: ManagedDevice) =>
+          item.id === deviceId) ?? localDevice();
         if (device.isLocal()) {
           this.pushRecentPath(cwd);
         }
@@ -1205,7 +1206,7 @@ struct Index {
         }
         break;
       case KEYCODE_T:
-        this.newSession('', '', '', '', this.activeDevice());
+        this.newDialogCtrl.open();
         break;
       case KEYCODE_W:
         if (this.currentIdx >= 0 && this.currentIdx < this.sessions.length) {
@@ -1238,7 +1239,7 @@ struct Index {
               this.closeSession(s);
             }
           },
-          onNewTerminal: () => { this.newSession('', '', '', '', this.activeDevice()); },
+          onNewTerminal: () => { this.newDialogCtrl.open(); },
           onNewSpace: () => { this.newSpaceCtrl.open(); },
           onSearch: () => { this.paletteCtrl.open(); },
           onCloseSession: (s: TerminalSession) => this.closeSession(s),

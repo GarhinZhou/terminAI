@@ -8,7 +8,7 @@ import { IconName, UiIcon } from '../common/Icons';
 import { CustomAgentInfo, decodeCustomAgents } from '../model/CustomAgent';
 import { remoteAgentsForDevice } from '../model/RemoteSshState';
 import { overridesForDevice } from '../model/AgentOverrides';
-import { LOCAL_DEVICE_ID } from '../model/ManagedDevice';
+import { LOCAL_DEVICE_ID, decodeDevices, ManagedDevice } from '../model/ManagedDevice';
 
 /** An executable discovered on PATH (shell or coding-agent CLI). */
 class ProgramInfo {
@@ -26,7 +26,7 @@ class ProgramInfo {
 @CustomDialog
 export struct NewAgentDialog {
   controller?: CustomDialogController;
-  onConfirm: (cwd: string, cmd: string, label: string, iconKind: string) => void = () => {};
+  onConfirm: (cwd: string, cmd: string, label: string, iconKind: string, deviceId: string) => void = () => {};
 
   @StorageLink('defaultCwd') cwd: string = '~';
   @StorageProp('recentPaths') recentPaths: string[] = [];
@@ -38,33 +38,59 @@ export struct NewAgentDialog {
   @StorageProp('agentOverrides') agentOverrides: string = '';
   @StorageProp('customAgents') customAgents: string = '';
   @StorageProp('accent') accent: string = '';
-  @StorageProp('selectedDeviceName') selectedDeviceName: string = '本机';
-  @StorageProp('selectedDeviceTarget') selectedDeviceTarget: string = '';
   @StorageProp('selectedDeviceId') selectedDeviceId: string = '';
   @StorageProp('remoteAgentsEncoded') remoteAgentsEncoded: string = '';
+  @StorageProp('devicesEncoded') devicesEncoded: string = '';
   @State private hoveredProgram: string = '';
+  // Device chosen inside this sheet (defaults to the sidebar's active device).
+  @State private deviceOptions: ManagedDevice[] = [];
+  @State private chosenDeviceId: string = LOCAL_DEVICE_ID;
+  @State private chosenDeviceName: string = '本机';
+  @State private chosenDeviceTarget: string = '';
   private documentPicker: picker.DocumentViewPicker = new picker.DocumentViewPicker();
 
   aboutToAppear(): void {
+    this.deviceOptions = decodeDevices(this.devicesEncoded);
+    const initialId = this.selectedDeviceId.length > 0 ? this.selectedDeviceId : LOCAL_DEVICE_ID;
+    this.selectDevice(initialId, true);
     const pending = AppStorage.get<string>('pendingNewCwd');
-    if (pending !== undefined && pending.length > 0) {
+    if (pending !== undefined && pending.length > 0 && this.chosenDeviceTarget.length === 0) {
       this.cwd = pending;
       AppStorage.setOrCreate('pendingNewCwd', '');
     }
+    this.refreshPrograms();
+  }
+
+  private selectDevice(deviceId: string, resetCwd: boolean): void {
+    const device = this.deviceOptions.find((item: ManagedDevice) => item.id === deviceId) ??
+      (deviceId === LOCAL_DEVICE_ID ? new ManagedDevice(LOCAL_DEVICE_ID, '本机', '') :
+        new ManagedDevice(deviceId, deviceId, ''));
+    this.chosenDeviceId = device.id;
+    this.chosenDeviceName = device.name;
+    this.chosenDeviceTarget = device.sshTarget;
+    if (resetCwd && device.sshTarget.length > 0) {
+      this.cwd = '~';
+    }
+  }
+
+  private refreshPrograms(): void {
     this.selectedIdx = 0;
-    if (this.selectedDeviceTarget.length > 0) {
-      if (pending === undefined || pending.length === 0) {
-        this.cwd = '~';
-      }
+    if (this.chosenDeviceTarget.length > 0) {
       this.programs = this.remotePrograms();
       if (this.defaultProgram.length > 0) {
         const selected = this.programs.findIndex((item: ProgramInfo) => item.name === this.defaultProgram);
-        if (selected >= 0) {
-          this.selectedIdx = selected;
-        }
+        if (selected >= 0) this.selectedIdx = selected;
       }
       return;
     }
+    this.programs = this.localPrograms();
+    if (this.defaultProgram.length > 0) {
+      const di = this.programs.findIndex((p: ProgramInfo) => p.name === this.defaultProgram);
+      if (di >= 0) this.selectedIdx = di;
+    }
+  }
+
+  private localPrograms(): ProgramInfo[] {
     try {
       const probed: ProgramInfo[] = [];
       for (const item of libterminal.listPrograms()) {
@@ -105,11 +131,7 @@ export struct NewAgentDialog {
           list.push(customProgram);
         }
       }
-      this.programs = list;
-      if (this.defaultProgram.length > 0) {
-        const di = list.findIndex((p: ProgramInfo) => p.name === this.defaultProgram);
-        if (di >= 0) this.selectedIdx = di;
-      }
+      return list;
     } catch (e) {
       console.error('TERMINAI listPrograms failed: ' + JSON.stringify(e));
       const fallback: ProgramInfo[] = [new ProgramInfo('zsh', '/usr/bin/zsh', 'zsh')];
@@ -117,20 +139,20 @@ export struct NewAgentDialog {
         .filter((item: CustomAgentInfo) => item.deviceId === LOCAL_DEVICE_ID)) {
         fallback.push(new ProgramInfo(custom.name, custom.command, 'gemini'));
       }
-      this.programs = fallback;
+      return fallback;
     }
   }
 
   private remotePrograms(): ProgramInfo[] {
-    const shellName = AppStorage.get<string>('remoteShell_' + this.selectedDeviceId);
+    const shellName = AppStorage.get<string>('remoteShell_' + this.chosenDeviceId);
     const defaultShell = shellName !== undefined && shellName.length > 0 ? shellName : 'sh';
     const list: ProgramInfo[] = [new ProgramInfo(defaultShell, defaultShell, defaultShell)];
-    const remoteAgents = remoteAgentsForDevice(this.remoteAgentsEncoded, this.selectedDeviceId);
+    const remoteAgents = remoteAgentsForDevice(this.remoteAgentsEncoded, this.chosenDeviceId);
     for (const agent of remoteAgents) {
       list.push(new ProgramInfo(agent.name, agent.path, agent.iconKind));
     }
     // Per-device binary-path overrides win over the scanned remote paths.
-    const overrides = overridesForDevice(this.agentOverrides, this.selectedDeviceId);
+    const overrides = overridesForDevice(this.agentOverrides, this.chosenDeviceId);
     Object.keys(overrides).forEach((k: string) => {
       const hit = list.findIndex((item: ProgramInfo) => item.name === k);
       if (hit >= 0) {
@@ -139,7 +161,7 @@ export struct NewAgentDialog {
     });
     // Custom agents defined for this device.
     for (const custom of decodeCustomAgents(this.customAgents)
-      .filter((item: CustomAgentInfo) => item.deviceId === this.selectedDeviceId)) {
+      .filter((item: CustomAgentInfo) => item.deviceId === this.chosenDeviceId)) {
       const hit = list.findIndex((item: ProgramInfo) =>
         item.name.toLowerCase() === custom.name.toLowerCase());
       const customProgram = new ProgramInfo(custom.name, custom.command, 'gemini');
@@ -156,10 +178,10 @@ export struct NewAgentDialog {
     if (this.cwd.trim().length === 0) return;
     // Index 0 is always the default login shell for the selected device.
     if (this.selectedIdx === 0) {
-      this.onConfirm(this.cwd.trim(), '', '', '');
+      this.onConfirm(this.cwd.trim(), '', '', '', this.chosenDeviceId);
     } else {
       const p = this.programs[this.selectedIdx];
-      this.onConfirm(this.cwd.trim(), p.path, p.name, p.iconKind);
+      this.onConfirm(this.cwd.trim(), p.path, p.name, p.iconKind, this.chosenDeviceId);
     }
     this.controller?.close();
   }
@@ -244,7 +266,7 @@ export struct NewAgentDialog {
           .fontSize(17)
           .fontWeight(FontWeight.Bold)
           .fontColor(Theme.text(this.isDark))
-        Text('在' + this.selectedDeviceName + '的所选空间中启动，并连接到实时终端')
+        Text('在' + this.chosenDeviceName + '的所选空间中启动，并连接到实时终端')
           .fontSize(13)
           .fontColor(Theme.tertiary(this.isDark))
       }
@@ -263,12 +285,38 @@ export struct NewAgentDialog {
       Divider().color(Theme.divider(this.isDark)).strokeWidth(1)
 
       Column() {
-        Text('程序')
+        // ── Device selector ──
+        Text('设备')
           .fontSize(12)
           .fontWeight(FontWeight.Medium)
           .fontColor(Theme.tertiary(this.isDark))
           .width('100%')
           .margin({ bottom: 8 })
+        Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.Start }) {
+          ForEach(this.deviceOptions, (d: ManagedDevice) => {
+            Text(d.name)
+              .fontSize(14)
+              .fontColor(this.chosenDeviceId === d.id ? Theme.onAccent(this.isDark) : Theme.text(this.isDark))
+              .backgroundColor(this.chosenDeviceId === d.id ? Theme.accent(this.isDark) : Theme.input(this.isDark))
+              .borderRadius(13)
+              .padding({ left: 14, right: 14, top: 6, bottom: 6 })
+              .margin({ right: 8, bottom: 6 })
+              .onClick(() => {
+                this.selectDevice(d.id, true);
+                this.refreshPrograms();
+              })
+              .accessibilityText('设备 ' + d.name)
+              .accessibilitySelected(this.chosenDeviceId === d.id)
+          }, (d: ManagedDevice) => d.id)
+        }
+        .width('100%')
+
+        Text('程序')
+          .fontSize(12)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Theme.tertiary(this.isDark))
+          .width('100%')
+          .margin({ top: 8, bottom: 8 })
 
         Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.Start }) {
           ForEach(this.programs, (p: ProgramInfo, idx: number) => {
@@ -296,7 +344,7 @@ export struct NewAgentDialog {
             .borderRadius(7)
             .onChange((v: string) => { this.cwd = v; })
             .onSubmit(() => { this.confirm(); })
-          if (this.selectedDeviceTarget.length === 0) {
+          if (this.chosenDeviceTarget.length === 0) {
             Blank().width(6)
             Row() {
               UiIcon({ name: IconName.Browse, iconSize: 15, color: Theme.text(this.isDark) })
@@ -316,7 +364,7 @@ export struct NewAgentDialog {
         .width('100%')
 
         // Recent spaces as quick picks
-        if (this.selectedDeviceTarget.length === 0 && this.spaces().length > 0) {
+        if (this.chosenDeviceTarget.length === 0 && this.spaces().length > 0) {
           Text('最近使用的空间')
             .fontSize(12)
             .fontColor(Theme.faintText(this.isDark))
