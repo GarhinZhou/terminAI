@@ -7,35 +7,10 @@
 <style>
   html, body { margin: 0; padding: 0; height: 100%; background: #1e1e1e; overflow: hidden; }
   #terminal { width: 100%; height: 100%; }
-  #ctxmenu {
-    display: none;
-    position: absolute;
-    z-index: 1000;
-    min-width: 140px;
-    background: #2a2a2e;
-    border: 1px solid #3a3a3f;
-    border-radius: 8px;
-    padding: 4px;
-    box-shadow: 0 6px 20px rgba(0,0,0,0.45);
-    font-family: sans-serif;
-    font-size: 13px;
-    color: #e0e0e0;
-  }
-  #ctxmenu div {
-    padding: 7px 12px;
-    border-radius: 5px;
-    cursor: pointer;
-  }
-  #ctxmenu div:hover { background: #3a3a3f; }
 </style>
 </head>
 <body>
 <div id="terminal"></div>
-<div id="ctxmenu">
-  <div data-act="copy">复制</div>
-  <div data-act="paste">粘贴</div>
-  <div data-act="selectall">全选</div>
-</div>
 <script src="xterm.js"></script>
 <script src="addon-fit.js"></script>
 <script>
@@ -205,28 +180,12 @@
     return true;
   });
 
-  // Right-click context menu.
-  var ctxMenu = document.getElementById('ctxmenu');
-  function hideMenu() { ctxMenu.style.display = 'none'; }
-  function showMenu(x, y) {
-    ctxMenu.style.left = x + 'px';
-    ctxMenu.style.top = y + 'px';
-    ctxMenu.style.display = 'block';
-  }
-  document.addEventListener('contextmenu', function (e) {
-    e.preventDefault();
-    showMenu(e.clientX, e.clientY);
-  });
-  document.addEventListener('click', function (e) {
-    if (!ctxMenu.contains(e.target)) hideMenu();
-  });
-  ctxMenu.addEventListener('click', function (e) {
-    var act = e.target.getAttribute('data-act');
-    if (act === 'copy') copySelection();
-    else if (act === 'paste') pasteClipboard();
-    else if (act === 'selectall') term.selectAll();
-    hideMenu();
-  });
+  // Right-click is handled by the ArkUI native context menu; expose the
+  // clipboard/selection actions it invokes.
+  window.termCopySelection = copySelection;
+  window.termPasteClipboard = pasteClipboard;
+  window.termSelectAll = function () { term.selectAll(); };
+  document.addEventListener('contextmenu', function (e) { e.preventDefault(); });
 })();
 </script>
 </body>

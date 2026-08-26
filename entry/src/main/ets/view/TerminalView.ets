@@ -280,5 +280,24 @@ export struct TerminalView {
       .width('100%')
       .height('100%')
       .backgroundColor(Theme.terminalBg(this.isDark))
+      .bindContextMenu(this.termMenuBuilder, ResponseType.RightClick)
+  }
+
+  @Builder
+  termMenuBuilder() {
+    Menu() {
+      MenuItem({ content: '复制' })
+        .onClick(() => {
+          this.controller.runJavaScript('window.termCopySelection()').catch(() => {});
+        })
+      MenuItem({ content: '粘贴' })
+        .onClick(() => {
+          this.controller.runJavaScript('window.termPasteClipboard()').catch(() => {});
+        })
+      MenuItem({ content: '全选' })
+        .onClick(() => {
+          this.controller.runJavaScript('window.termSelectAll()').catch(() => {});
+        })
+    }
   }
 }
