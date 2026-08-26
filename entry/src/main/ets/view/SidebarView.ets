@@ -43,7 +43,6 @@ export struct SidebarView {
   onNewAgent: () => void = () => {};
   onNewAgentIn: (cwd: string, deviceId: string) => void = () => {};
   onCloseSpace: (cwd: string, deviceId: string) => void = () => {};
-  onNewTerminal: () => void = () => {};
   onNewSpace: () => void = () => {};
   onSearch: () => void = () => {};
   onCloseSession: (s: TerminalSession) => void = () => {};
@@ -905,8 +904,6 @@ export struct SidebarView {
       Column({ space: 2 }) {
         this.actionRow(IconName.NewAgent, 'new_agent', '新建智能体', 'Ctrl + N',
           () => { this.onNewAgent(); })
-        this.actionRow(IconName.Terminal, 'new_terminal', '新建终端', 'Ctrl + T',
-          () => { this.onNewTerminal(); })
         this.actionRow(IconName.Search, 'search', '搜索', 'Ctrl + K',
           () => { this.onSearch(); })
       }

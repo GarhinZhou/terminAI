@@ -218,7 +218,7 @@ export struct NewAgentDialog {
   @Builder
   kindCell(p: ProgramInfo, idx: number) {
     Column() {
-      if (p.iconKind === 'zsh') {
+      if (idx === 0) {
         UiIcon({
           name: IconName.Terminal,
           iconSize: 20,

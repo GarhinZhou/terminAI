@@ -1239,7 +1239,6 @@ struct Index {
               this.closeSession(s);
             }
           },
-          onNewTerminal: () => { this.newDialogCtrl.open(); },
           onNewSpace: () => { this.newSpaceCtrl.open(); },
           onSearch: () => { this.paletteCtrl.open(); },
           onCloseSession: (s: TerminalSession) => this.closeSession(s),
