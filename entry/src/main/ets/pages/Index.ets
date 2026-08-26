@@ -73,6 +73,7 @@ const PREF_CUSTOM_AGENTS = 'customAgents';       // URI-encoded custom agent rec
 const PREF_DEVICES = 'sshDevices';                // URI-encoded ManagedDevice records
 const PREF_SELECTED_DEVICE = 'selectedDevice';   // empty = all devices
 const PREF_REMOTE_AGENTS = 'remoteAgents';       // per-device scanned executable catalog
+const PREF_REMOTE_SHELLS = 'remoteShells';        // JSON {deviceId: loginShell}
 
 @Entry
 @Component
@@ -658,7 +659,12 @@ struct Index {
     const scanScript = 'for terminai_name in ' + names + '; do ' +
       'terminai_path=$(command -v "$terminai_name" 2>/dev/null) || continue; ' +
       'printf "__TERMINAI_AGENT__\\t%s\\t%s\\n" "$terminai_name" "$terminai_path"; done; ' +
-      'printf "__TERMINAI_SHELL__\\t%s\\n" "$(basename "${SHELL:-/bin/sh}")";';
+      // The non-interactive ssh command runs in /bin/sh without SHELL set to the
+      // login shell, so read the real login shell from passwd and only fall back
+      // to ${SHELL} when getent is unavailable.
+      'terminai_shell=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); ' +
+      'if [ -z "$terminai_shell" ]; then terminai_shell="${SHELL:-/bin/sh}"; fi; ' +
+      'printf "__TERMINAI_SHELL__\\t%s\\n" "$(basename "$terminai_shell")";';
     const remoteScript = 'exec "${SHELL:-/bin/sh}" -lc ' + this.shellQuote(scanScript);
     const knownHosts = this.connectionFilePath(connection.deviceId, '-known-hosts');
     return '/usr/bin/ssh -T -o BatchMode=no -o ConnectTimeout=10 ' +
@@ -748,6 +754,7 @@ struct Index {
       const agents = this.parseRemoteAgents(connection);
       connection.remoteShell = this.parseRemoteShell(connection);
       AppStorage.setOrCreate('remoteShell_' + connection.deviceId, connection.remoteShell);
+      this.saveRemoteShell(connection.deviceId, connection.remoteShell);
       this.remoteAgentsEncoded = replaceRemoteAgents(this.remoteAgentsEncoded, connection.deviceId, agents);
       AppStorage.setOrCreate('remoteAgentsEncoded', this.remoteAgentsEncoded);
       this.saveRemoteAgents();
@@ -790,6 +797,28 @@ struct Index {
       store.flush();
     } catch (e) {
       console.error('TERMINAI save remote agents failed: ' + JSON.stringify(e));
+    }
+  }
+
+  /** Persist the detected remote login shell so it survives app restarts. */
+  private saveRemoteShell(deviceId: string, shell: string): void {
+    try {
+      const context = this.getUIContext().getHostContext();
+      if (context === undefined || shell.length === 0) {
+        return;
+      }
+      const store = preferences.getPreferencesSync(context, { name: PREF_NAME });
+      let map: Record<string, string> = {};
+      try {
+        map = JSON.parse(store.getSync(PREF_REMOTE_SHELLS, '{}') as string) as Record<string, string>;
+      } catch (e) {
+        map = {};
+      }
+      map[deviceId] = shell;
+      store.putSync(PREF_REMOTE_SHELLS, JSON.stringify(map));
+      store.flush();
+    } catch (e) {
+      console.error('TERMINAI save remote shell failed: ' + JSON.stringify(e));
     }
   }
 
@@ -860,6 +889,16 @@ struct Index {
       AppStorage.setOrCreate('devicesEncoded', savedDevices);
       AppStorage.setOrCreate('selectedDeviceId', savedDeviceId);
       AppStorage.setOrCreate('remoteAgentsEncoded', savedRemoteAgents);
+      // Restore persisted remote login shells (detected on first connection).
+      try {
+        const savedShells = store.getSync(PREF_REMOTE_SHELLS, '{}') as string;
+        const shellMap = JSON.parse(savedShells) as Record<string, string>;
+        Object.keys(shellMap).forEach((id: string) => {
+          AppStorage.setOrCreate('remoteShell_' + id, shellMap[id]);
+        });
+      } catch (e) {
+        console.error('TERMINAI restore remote shells failed: ' + JSON.stringify(e));
+      }
       AppStorage.setOrCreate('sshConnectionStates', '');
       this.devicesEncoded = savedDevices;
       this.selectedDeviceId = savedDeviceId;
