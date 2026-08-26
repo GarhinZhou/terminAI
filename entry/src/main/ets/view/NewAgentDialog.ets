@@ -5,7 +5,7 @@ import libterminal from 'libterminal.so';
 import { Theme } from '../common/Theme';
 import { BrandIcon } from '../common/BrandIcon';
 import { IconName, UiIcon } from '../common/Icons';
-import { decodeCustomAgents } from '../model/CustomAgent';
+import { CustomAgentInfo, decodeCustomAgents } from '../model/CustomAgent';
 import { remoteAgentsForDevice } from '../model/RemoteSshState';
 import { overridesForDevice } from '../model/AgentOverrides';
 import { LOCAL_DEVICE_ID } from '../model/ManagedDevice';
@@ -94,7 +94,8 @@ export struct NewAgentDialog {
           list.push(new ProgramInfo(k, ov[k], k));
         }
       });
-      for (const custom of decodeCustomAgents(this.customAgents)) {
+      for (const custom of decodeCustomAgents(this.customAgents)
+        .filter((item: CustomAgentInfo) => item.deviceId === LOCAL_DEVICE_ID)) {
         const hit = list.findIndex((it: ProgramInfo) =>
           it.name.toLowerCase() === custom.name.toLowerCase());
         const customProgram = new ProgramInfo(custom.name, custom.command, 'gemini');
@@ -112,7 +113,8 @@ export struct NewAgentDialog {
     } catch (e) {
       console.error('TERMINAI listPrograms failed: ' + JSON.stringify(e));
       const fallback: ProgramInfo[] = [new ProgramInfo('zsh', '/usr/bin/zsh', 'zsh')];
-      for (const custom of decodeCustomAgents(this.customAgents)) {
+      for (const custom of decodeCustomAgents(this.customAgents)
+        .filter((item: CustomAgentInfo) => item.deviceId === LOCAL_DEVICE_ID)) {
         fallback.push(new ProgramInfo(custom.name, custom.command, 'gemini'));
       }
       this.programs = fallback;
@@ -135,6 +137,18 @@ export struct NewAgentDialog {
         list[hit] = new ProgramInfo(k, overrides[k], k);
       }
     });
+    // Custom agents defined for this device.
+    for (const custom of decodeCustomAgents(this.customAgents)
+      .filter((item: CustomAgentInfo) => item.deviceId === this.selectedDeviceId)) {
+      const hit = list.findIndex((item: ProgramInfo) =>
+        item.name.toLowerCase() === custom.name.toLowerCase());
+      const customProgram = new ProgramInfo(custom.name, custom.command, 'gemini');
+      if (hit >= 0) {
+        list[hit] = customProgram;
+      } else {
+        list.push(customProgram);
+      }
+    }
     return list;
   }
 

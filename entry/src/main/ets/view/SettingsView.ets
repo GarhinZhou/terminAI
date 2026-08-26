@@ -94,7 +94,7 @@ export struct SettingsView {
   aboutToAppear(): void {
     this.deviceOptions = decodeDevices(this.devicesEncoded);
     this.loadDrafts();
-    this.customAgentItems = decodeCustomAgents(this.customAgents);
+    this.loadCustomAgents();
   }
 
   private loadDrafts(): void {
@@ -102,6 +102,11 @@ export struct SettingsView {
     const m = new Map<string, string>();
     Object.keys(overrides).forEach((k: string) => { m.set(k, overrides[k]); });
     this.drafts = m;
+  }
+
+  private loadCustomAgents(): void {
+    this.customAgentItems = decodeCustomAgents(this.customAgents)
+      .filter((item: CustomAgentInfo) => item.deviceId === this.selectedDevice);
   }
 
   private commitOverrides(): void {
@@ -128,7 +133,10 @@ export struct SettingsView {
   }
 
   private commitCustomAgents(items: CustomAgentInfo[]): void {
-    const encoded = encodeCustomAgents(items);
+    // Preserve other devices' custom agents; replace only this device's set.
+    const others = decodeCustomAgents(this.customAgents)
+      .filter((item: CustomAgentInfo) => item.deviceId !== this.selectedDevice);
+    const encoded = encodeCustomAgents(others.concat(items));
     this.customAgentItems = items;
     this.customAgents = encoded;
     this.onCustomAgentsChanged(encoded);
@@ -143,7 +151,7 @@ export struct SettingsView {
     const next = this.customAgentItems.slice();
     const existing = next.findIndex((item: CustomAgentInfo) =>
       item.name.toLowerCase() === name.toLowerCase());
-    const custom = new CustomAgentInfo(name, command);
+    const custom = new CustomAgentInfo(this.selectedDevice, name, command);
     if (existing >= 0) {
       next[existing] = custom;
     } else {
@@ -490,6 +498,7 @@ export struct SettingsView {
                     .onClick(() => {
                       this.selectedDevice = d.id;
                       this.loadDrafts();
+                      this.loadCustomAgents();
                     })
                 }, (d: ManagedDevice) => d.id)
               }
