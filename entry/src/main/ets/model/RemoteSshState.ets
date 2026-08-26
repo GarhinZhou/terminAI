@@ -59,6 +59,8 @@ export class SshRuntimeConnection {
   authOutput: string = '';
   scanOutput: string = '';
   pendingSessions: PendingRemoteSession[] = [];
+  /** Login-shell name detected during the remote scan (e.g. bash, zsh, fish). */
+  remoteShell: string = '';
 
   constructor(deviceId: string, target: string) {
     this.deviceId = deviceId;

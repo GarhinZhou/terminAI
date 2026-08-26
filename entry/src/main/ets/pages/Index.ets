@@ -19,6 +19,7 @@ import { IconName, UiIcon } from '../common/Icons';
 import { SessionNumberBadge } from '../common/SessionNumberBadge';
 import { DeviceManagerDialog } from '../view/DeviceManagerDialog';
 import { ManagedDevice, decodeDevices, LOCAL_DEVICE_ID, localDevice, normalizedSshTarget } from '../model/ManagedDevice';
+import { migrateAgentOverrides } from '../model/AgentOverrides';
 import { SshCredentialStore } from '../model/SshCredentialStore';
 import { PendingRemoteSession, RemoteAgentInfo, SshConnectionState, SshRuntimeConnection,
   SshSecretValue, encodeConnectionStates, removeRemoteAgents,
@@ -506,7 +507,10 @@ struct Index {
       this.currentIdx = this.sessions.indexOf(existing);
       return;
     }
-    this.newSession('', '', '', '', device);
+    const connection = this.sshConnection(device.id);
+    const shellName = connection !== null && connection.remoteShell.length > 0 ?
+      connection.remoteShell : 'sh';
+    this.newSession('', '', '', '', device, shellName);
   }
 
   private buildMasterCommand(connection: SshRuntimeConnection): string {
@@ -652,7 +656,8 @@ struct Index {
     const names = this.remoteAgentCandidates().map((item: RemoteAgentCandidate) => item.name).join(' ');
     const scanScript = 'for terminai_name in ' + names + '; do ' +
       'terminai_path=$(command -v "$terminai_name" 2>/dev/null) || continue; ' +
-      'printf "__TERMINAI_AGENT__\\t%s\\t%s\\n" "$terminai_name" "$terminai_path"; done';
+      'printf "__TERMINAI_AGENT__\\t%s\\t%s\\n" "$terminai_name" "$terminai_path"; done; ' +
+      'printf "__TERMINAI_SHELL__\\t%s\\n" "$(basename "${SHELL:-/bin/sh}")";';
     const remoteScript = 'exec "${SHELL:-/bin/sh}" -lc ' + this.shellQuote(scanScript);
     const knownHosts = this.connectionFilePath(connection.deviceId, '-known-hosts');
     return '/usr/bin/ssh -T -o BatchMode=no -o ConnectTimeout=10 ' +
@@ -688,8 +693,21 @@ struct Index {
     }
   }
 
-  private parseRemoteAgents(connection: SshRuntimeConnection): RemoteAgentInfo[] {
-    const agents: RemoteAgentInfo[] = [];
+  private parseRemoteShell(connection: SshRuntimeConnection): string {
+    for (const rawLine of connection.scanOutput.split('\n')) {
+      const line = rawLine.replace(/\r/g, '');
+      if (!line.startsWith('__TERMINAI_SHELL__\t')) {
+        continue;
+      }
+      const fields = line.split('\t');
+      if (fields.length === 2 && fields[1].length > 0) {
+        return fields[1];
+      }
+    }
+    return '';
+  }
+
+  private parseRemoteAgents(connection: SshRuntimeConnection): RemoteAgentInfo[] {    const agents: RemoteAgentInfo[] = [];
     const candidates = this.remoteAgentCandidates();
     for (const rawLine of connection.scanOutput.split('\n')) {
       const line = rawLine.replace(/\r/g, '');
@@ -727,6 +745,8 @@ struct Index {
   private finishRemoteScan(connection: SshRuntimeConnection, success: boolean): void {
     if (success) {
       const agents = this.parseRemoteAgents(connection);
+      connection.remoteShell = this.parseRemoteShell(connection);
+      AppStorage.setOrCreate('remoteShell_' + connection.deviceId, connection.remoteShell);
       this.remoteAgentsEncoded = replaceRemoteAgents(this.remoteAgentsEncoded, connection.deviceId, agents);
       AppStorage.setOrCreate('remoteAgentsEncoded', this.remoteAgentsEncoded);
       this.saveRemoteAgents();
@@ -748,7 +768,9 @@ struct Index {
     const pending = connection.pendingSessions;
     connection.pendingSessions = [];
     for (const request of pending) {
-      this.newSession(request.cwd, request.cmd, request.label, request.iconKind, device);
+      const shellName = (request.cmd.length === 0 && request.label.length === 0) ?
+        (connection.remoteShell.length > 0 ? connection.remoteShell : 'sh') : 'zsh';
+      this.newSession(request.cwd, request.cmd, request.label, request.iconKind, device, shellName);
     }
     if (connection.openTerminalOnReady) {
       connection.openTerminalOnReady = false;
@@ -831,7 +853,8 @@ struct Index {
       AppStorage.setOrCreate('autoNewSession', store.getSync(PREF_AUTO_NEW_SESSION, true) as boolean);
       AppStorage.setOrCreate('lineHeight', store.getSync(PREF_LINE_HEIGHT, 1.0) as number);
       AppStorage.setOrCreate('fontFamily', store.getSync(PREF_FONT_FAMILY, '') as string);
-      AppStorage.setOrCreate('agentOverrides', store.getSync(PREF_AGENT_OVERRIDES, '') as string);
+      AppStorage.setOrCreate('agentOverrides',
+        migrateAgentOverrides(store.getSync(PREF_AGENT_OVERRIDES, '') as string));
       AppStorage.setOrCreate('customAgents', savedCustomAgents);
       AppStorage.setOrCreate('devicesEncoded', savedDevices);
       AppStorage.setOrCreate('selectedDeviceId', savedDeviceId);
@@ -952,8 +975,17 @@ struct Index {
   }
 
   private newSession(startCwd: string = '', cmd: string = '', label: string = '',
-    iconKind: string = '', device: ManagedDevice = localDevice()): void {
+    iconKind: string = '', device: ManagedDevice = localDevice(), shellName: string = ''): void {
     const cwd = startCwd.length > 0 ? startCwd : (device.isLocal() ? this.defaultCwd : '~');
+    let finalShell = shellName.length > 0 ? shellName : (device.isLocal() ? 'zsh' : 'sh');
+    // For remote terminals the login shell is the host's $SHELL (e.g. bash);
+    // prefer the value detected during the connection scan.
+    if (!device.isLocal() && (shellName.length === 0 || shellName === 'sh')) {
+      const connection = this.sshConnection(device.id);
+      if (connection !== null && connection.remoteShell.length > 0) {
+        finalShell = connection.remoteShell;
+      }
+    }
     let controlPath = '';
     let knownHostsPath = '';
     if (!device.isLocal()) {
@@ -972,7 +1004,7 @@ struct Index {
       knownHostsPath = this.connectionFilePath(device.id, '-known-hosts');
     }
     const s = this.mgr.newSession(cwd, cmd, label, iconKind, device.id, device.name,
-      device.sshTarget, controlPath, knownHostsPath);
+      device.sshTarget, controlPath, knownHostsPath, finalShell);
     s.onStateChanged = () => {
       if (!s.alive) {
         // session exited: notify only if user isn't looking at it
@@ -1009,7 +1041,7 @@ struct Index {
       return s.agentKind;
     }
     if (s.cmd.length === 0) {
-      return 'zsh';
+      return s.shellName;
     }
     const parts = s.cmd.split('/');
     return parts.length > 0 ? parts[parts.length - 1] : s.cmd;

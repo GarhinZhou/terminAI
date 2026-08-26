@@ -39,6 +39,8 @@ export class TerminalSession {
   cwd: string = '~';
   /** Optional command to run instead of the default login shell. */
   cmd: string = '';
+  /** Login-shell name shown for plain terminals (zsh local, bash/fish/sh remote). */
+  shellName: string = 'zsh';
   /** Logical agent kind selected by the user; independent of executable path overrides. */
   agentKind: string = '';
   /** Brand icon kind; custom agents use the shared Gemini mark. */
@@ -392,9 +394,9 @@ export class SessionManager {
   newSession(startCwd: string = '~',
     cmd: string = '', label: string = '', iconKind: string = '', deviceId: string = 'local',
     deviceName: string = '本机', sshTarget: string = '', sshControlPath: string = '',
-    sshKnownHostsPath: string = ''): TerminalSession {
+    sshKnownHostsPath: string = '', shellName: string = 'zsh'): TerminalSession {
     this.uidCounter++;
-    const base = label.length > 0 ? label : 'zsh';
+    const base = label.length > 0 ? label : shellName;
     const counterKey = base.toLowerCase();
     const nextCount = this.nextSequence(counterKey);
     const s = new TerminalSession(this.capitalizeName(base), nextCount);
@@ -402,6 +404,7 @@ export class SessionManager {
     s.typeKey = counterKey;
     s.cwd = startCwd;
     s.cmd = cmd;
+    s.shellName = shellName;
     s.agentKind = label;
     s.agentIconKind = iconKind.length > 0 ? iconKind : label;
     s.deviceId = deviceId;

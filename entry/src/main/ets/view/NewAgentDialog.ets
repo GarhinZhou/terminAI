@@ -7,6 +7,8 @@ import { BrandIcon } from '../common/BrandIcon';
 import { IconName, UiIcon } from '../common/Icons';
 import { decodeCustomAgents } from '../model/CustomAgent';
 import { remoteAgentsForDevice } from '../model/RemoteSshState';
+import { overridesForDevice } from '../model/AgentOverrides';
+import { LOCAL_DEVICE_ID } from '../model/ManagedDevice';
 
 /** An executable discovered on PATH (shell or coding-agent CLI). */
 class ProgramInfo {
@@ -82,20 +84,16 @@ export struct NewAgentDialog {
           list.push(new ProgramInfo(p.name, p.path, p.iconKind));
         }
       }
-      // Settings → Agents binary-path overrides win over probed paths.
-      try {
-        const ov = JSON.parse(this.agentOverrides.length > 0 ? this.agentOverrides : '{}') as Record<string, string>;
-        Object.keys(ov).forEach((k: string) => {
-          const hit = list.findIndex((it: ProgramInfo) => it.name === k);
-          if (hit >= 0) {
-            list[hit] = new ProgramInfo(k, ov[k], k);
-          } else {
-            list.push(new ProgramInfo(k, ov[k], k));
-          }
-        });
-      } catch (e) {
-        console.error('TERMINAI overrides parse failed: ' + JSON.stringify(e));
-      }
+      // Settings → Agents binary-path overrides (local device) win over probed paths.
+      const ov = overridesForDevice(this.agentOverrides, LOCAL_DEVICE_ID);
+      Object.keys(ov).forEach((k: string) => {
+        const hit = list.findIndex((it: ProgramInfo) => it.name === k);
+        if (hit >= 0) {
+          list[hit] = new ProgramInfo(k, ov[k], k);
+        } else {
+          list.push(new ProgramInfo(k, ov[k], k));
+        }
+      });
       for (const custom of decodeCustomAgents(this.customAgents)) {
         const hit = list.findIndex((it: ProgramInfo) =>
           it.name.toLowerCase() === custom.name.toLowerCase());
@@ -122,17 +120,28 @@ export struct NewAgentDialog {
   }
 
   private remotePrograms(): ProgramInfo[] {
-    const list: ProgramInfo[] = [new ProgramInfo('zsh', 'zsh', 'zsh')];
+    const shellName = AppStorage.get<string>('remoteShell_' + this.selectedDeviceId);
+    const defaultShell = shellName !== undefined && shellName.length > 0 ? shellName : 'sh';
+    const list: ProgramInfo[] = [new ProgramInfo(defaultShell, defaultShell, defaultShell)];
     const remoteAgents = remoteAgentsForDevice(this.remoteAgentsEncoded, this.selectedDeviceId);
     for (const agent of remoteAgents) {
       list.push(new ProgramInfo(agent.name, agent.path, agent.iconKind));
     }
+    // Per-device binary-path overrides win over the scanned remote paths.
+    const overrides = overridesForDevice(this.agentOverrides, this.selectedDeviceId);
+    Object.keys(overrides).forEach((k: string) => {
+      const hit = list.findIndex((item: ProgramInfo) => item.name === k);
+      if (hit >= 0) {
+        list[hit] = new ProgramInfo(k, overrides[k], k);
+      }
+    });
     return list;
   }
 
   private confirm(): void {
     if (this.cwd.trim().length === 0) return;
-    if (this.programs[this.selectedIdx].name === 'zsh') {
+    // Index 0 is always the default login shell for the selected device.
+    if (this.selectedIdx === 0) {
       this.onConfirm(this.cwd.trim(), '', '', '');
     } else {
       const p = this.programs[this.selectedIdx];

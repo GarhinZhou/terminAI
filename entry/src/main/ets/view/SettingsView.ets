@@ -4,6 +4,8 @@ import { Theme } from '../common/Theme';
 import { BrandIcon } from '../common/BrandIcon';
 import { IconName, UiIcon } from '../common/Icons';
 import { CustomAgentInfo, decodeCustomAgents, encodeCustomAgents } from '../model/CustomAgent';
+import { ManagedDevice, decodeDevices, LOCAL_DEVICE_ID } from '../model/ManagedDevice';
+import { overridesForDevice, setOverridesForDevice } from '../model/AgentOverrides';
 
 interface KindRow {
   kind: string;
@@ -57,11 +59,14 @@ export struct SettingsView {
   @StorageLink('agentOverrides') agentOverrides: string = '';
   @StorageLink('customAgents') customAgents: string = '';
   @StorageProp('isDark') isDark: boolean = true;
+  @StorageProp('devicesEncoded') devicesEncoded: string = '';
   @State private tab: number = 0;
   @State private drafts: Map<string, string> = new Map();
   @State private customAgentItems: CustomAgentInfo[] = [];
   @State private customAgentName: string = '';
   @State private customAgentCommand: string = '';
+  @State private deviceOptions: ManagedDevice[] = [];
+  @State private selectedDevice: string = LOCAL_DEVICE_ID;
 
   private kinds: KindRow[] = [
     { kind: 'claude', label: 'Claude' },
@@ -87,15 +92,16 @@ export struct SettingsView {
   ];
 
   aboutToAppear(): void {
-    const m = new Map<string, string>();
-    try {
-      const obj = JSON.parse(this.agentOverrides.length > 0 ? this.agentOverrides : '{}') as Record<string, string>;
-      Object.keys(obj).forEach((k: string) => { m.set(k, obj[k]); });
-    } catch (e) {
-      console.error('TERMINAI agentOverrides parse failed: ' + JSON.stringify(e));
-    }
-    this.drafts = m;
+    this.deviceOptions = decodeDevices(this.devicesEncoded);
+    this.loadDrafts();
     this.customAgentItems = decodeCustomAgents(this.customAgents);
+  }
+
+  private loadDrafts(): void {
+    const overrides = overridesForDevice(this.agentOverrides, this.selectedDevice);
+    const m = new Map<string, string>();
+    Object.keys(overrides).forEach((k: string) => { m.set(k, overrides[k]); });
+    this.drafts = m;
   }
 
   private commitOverrides(): void {
@@ -103,7 +109,7 @@ export struct SettingsView {
     this.drafts.forEach((v: string, k: string) => {
       if (v.trim().length > 0) obj[k] = v.trim();
     });
-    this.agentOverrides = JSON.stringify(obj);
+    this.agentOverrides = setOverridesForDevice(this.agentOverrides, this.selectedDevice, obj);
   }
 
   private overrideOf(kind: string): string {
@@ -465,7 +471,34 @@ export struct SettingsView {
               .borderRadius(8)
               .margin({ top: 6 })
           } else if (this.tab === 2) {
-            // ── Agents ──
+            // ── Agents (per-device) ──
+            Row() {
+              Text('设备')
+                .fontSize(15)
+                .fontColor(Theme.text(this.isDark))
+                .layoutWeight(1)
+                .margin({ right: 10 })
+              Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.End }) {
+                ForEach(this.deviceOptions, (d: ManagedDevice) => {
+                  Text(d.name)
+                    .fontSize(14)
+                    .fontColor(this.selectedDevice === d.id ? Theme.onAccent(this.isDark) : Theme.text(this.isDark))
+                    .backgroundColor(this.selectedDevice === d.id ? Theme.accent(this.isDark) : Theme.input(this.isDark))
+                    .borderRadius(13)
+                    .padding({ left: 14, right: 14, top: 6, bottom: 6 })
+                    .margin({ left: 6 })
+                    .onClick(() => {
+                      this.selectedDevice = d.id;
+                      this.loadDrafts();
+                    })
+                }, (d: ManagedDevice) => d.id)
+              }
+            }
+            .width('100%')
+            .height(46)
+            .padding({ left: 12, right: 12 })
+            .margin({ bottom: 8 })
+
             Column() {
               ForEach(this.kinds, (row: KindRow) => {
                 Row() {
