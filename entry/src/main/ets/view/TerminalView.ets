@@ -132,11 +132,12 @@ export struct TerminalView {
       'sleep 0.3; done) & ';
     let remoteScript = changeDirectory + ' && ' + directoryMonitor;
     if (this.session.cmd.length > 0) {
-      // Return to a remote login shell after the agent exits, allowing the
-      // state machine to distinguish "已返回 Shell" from transport exit. The
-      // private OSC marker is consumed by the app and not rendered by xterm.
-      remoteScript += '(' + this.session.cmd +
-        '); printf \'\\033]777;terminai-agent-returned\\007\'; exec "${SHELL:-/bin/sh}" -l';
+      // Run the agent inside the remote login shell so its PATH matches an
+      // interactive login (bare custom-agent names resolve, unlike the
+      // non-login shell ssh starts commands in). Return to a login shell
+      // after the agent exits; the private OSC marker is consumed by the app.
+      remoteScript += '"${SHELL:-/bin/sh}" -lc ' + this.shellQuote(this.session.cmd) +
+        '; printf \'\\033]777;terminai-agent-returned\\007\'; exec "${SHELL:-/bin/sh}" -l';
     } else {
       remoteScript += 'exec "${SHELL:-/bin/sh}" -l';
     }
