@@ -52,6 +52,7 @@ export struct SettingsView {
   @StorageLink('fontFamily') fontFamily: string = '';
   @StorageLink('themeMode') themeMode: string = 'system';
   @StorageLink('notifyEnabled') notifyEnabled: boolean = true;
+  @StorageLink('autoConnectSsh') autoConnectSsh: boolean = false;
   @StorageLink('cursorStyle') cursorStyle: string = 'block';
   @StorageLink('colorScheme') colorScheme: string = 'default';
   @StorageLink('scrollback') scrollback: number = 10000;
@@ -668,6 +669,20 @@ export struct SettingsView {
                 Toggle({ type: ToggleType.Switch, isOn: this.notifyEnabled })
                   .selectedColor(Theme.accent(this.isDark))
                   .onChange((on: boolean) => { this.notifyEnabled = on; })
+              }
+              .width('100%')
+              .height(46)
+              .padding({ left: 12, right: 12 })
+              this.cardDivider()
+              Row() {
+                Text('启动时自动连接已保存的 SSH 主机')
+                  .fontSize(15)
+                  .fontColor(Theme.text(this.isDark))
+                  .layoutWeight(1)
+                  .margin({ right: 10 })
+                Toggle({ type: ToggleType.Switch, isOn: this.autoConnectSsh })
+                  .selectedColor(Theme.accent(this.isDark))
+                  .onChange((on: boolean) => { this.autoConnectSsh = on; })
               }
               .width('100%')
               .height(46)

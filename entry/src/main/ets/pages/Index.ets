@@ -65,6 +65,7 @@ const PREF_PROGRAM_ORDER = 'programOrder'; // comma-separated program names
 const PREF_DEFAULT_PROGRAM = 'defaultProgram'; // program name, "" = zsh
 const PREF_NOTIFY_ENABLED = 'notifyEnabled';
 const PREF_AUTO_NEW_SESSION = 'autoNewSession';
+const PREF_AUTO_CONNECT_SSH = 'autoConnectSsh';   // auto-connect saved SSH hosts on startup
 const PREF_RECENT_PATHS = 'recentPaths';   // JSON array, newest first, max 5
 const PREF_LINE_HEIGHT = 'lineHeight';
 const PREF_FONT_FAMILY = 'fontFamily';
@@ -96,6 +97,7 @@ struct Index {
   @StorageProp('defaultProgram') defaultProgram: string = '';
   @StorageProp('notifyEnabled') @Watch('onStyleChanged') notifyEnabled: boolean = true;
   @StorageProp('autoNewSession') @Watch('onStyleChanged') autoNewSession: boolean = true;
+  @StorageProp('autoConnectSsh') autoConnectSsh: boolean = false;
   @StorageProp('lineHeight') @Watch('onStyleChanged') lineHeight: number = 1.0;
   @StorageProp('fontFamily') @Watch('onStyleChanged') fontFamily: string = '';
   @StorageProp('agentOverrides') @Watch('onStyleChanged') agentOverrides: string = '';
@@ -217,9 +219,21 @@ struct Index {
     if (this.autoNewSession) {
       this.newSession();
     }
+    // Auto-connect saved SSH hosts (best-effort, no password prompts).
+    if (this.autoConnectSsh) {
+      this.autoConnectSavedDevices();
+    }
     this.activityTimer = setInterval(() => {
       this.refreshActivityStates();
     }, 400);
+  }
+
+  private autoConnectSavedDevices(): void {
+    for (const device of decodeDevices(this.devicesEncoded)) {
+      if (!device.isLocal()) {
+        this.connectDevice(device, false).catch(() => {});
+      }
+    }
   }
 
   private loadDefaultCwd(): void {
@@ -885,6 +899,7 @@ struct Index {
       AppStorage.setOrCreate('defaultProgram', store.getSync(PREF_DEFAULT_PROGRAM, '') as string);
       AppStorage.setOrCreate('notifyEnabled', store.getSync(PREF_NOTIFY_ENABLED, true) as boolean);
       AppStorage.setOrCreate('autoNewSession', store.getSync(PREF_AUTO_NEW_SESSION, true) as boolean);
+      AppStorage.setOrCreate('autoConnectSsh', store.getSync(PREF_AUTO_CONNECT_SSH, false) as boolean);
       AppStorage.setOrCreate('lineHeight', store.getSync(PREF_LINE_HEIGHT, 1.0) as number);
       AppStorage.setOrCreate('fontFamily', store.getSync(PREF_FONT_FAMILY, '') as string);
       AppStorage.setOrCreate('agentOverrides',
@@ -940,6 +955,7 @@ struct Index {
       store.putSync(PREF_DEFAULT_PROGRAM, this.defaultProgram);
       store.putSync(PREF_NOTIFY_ENABLED, this.notifyEnabled);
       store.putSync(PREF_AUTO_NEW_SESSION, this.autoNewSession);
+      store.putSync(PREF_AUTO_CONNECT_SSH, this.autoConnectSsh);
       store.putSync(PREF_LINE_HEIGHT, this.lineHeight);
       store.putSync(PREF_FONT_FAMILY, this.fontFamily);
       store.putSync(PREF_AGENT_OVERRIDES, this.agentOverrides);
