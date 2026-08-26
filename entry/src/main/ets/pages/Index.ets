@@ -659,10 +659,14 @@ struct Index {
     const scanScript = 'for terminai_name in ' + names + '; do ' +
       'terminai_path=$(command -v "$terminai_name" 2>/dev/null) || continue; ' +
       'printf "__TERMINAI_AGENT__\\t%s\\t%s\\n" "$terminai_name" "$terminai_path"; done; ' +
-      // The non-interactive ssh command runs in /bin/sh without SHELL set to the
-      // login shell, so read the real login shell from passwd and only fall back
-      // to ${SHELL} when getent is unavailable.
-      'terminai_shell=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); ' +
+      // Detect the real login shell: getent (Linux) or dscl (macOS), falling
+      // back to $SHELL. Non-interactive ssh starts commands in /bin/sh without
+      // SHELL set to the login shell, so $SHELL alone is unreliable.
+      'terminai_shell=""; ' +
+      'if command -v getent >/dev/null 2>&1; then ' +
+      'terminai_shell=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); fi; ' +
+      'if [ -z "$terminai_shell" ] && command -v dscl >/dev/null 2>&1; then ' +
+      'terminai_shell=$(dscl . -read "/Users/$(id -un)" UserShell 2>/dev/null | sed "s/^.* //"); fi; ' +
       'if [ -z "$terminai_shell" ]; then terminai_shell="${SHELL:-/bin/sh}"; fi; ' +
       'printf "__TERMINAI_SHELL__\\t%s\\n" "$(basename "$terminai_shell")";';
     const remoteScript = 'exec "${SHELL:-/bin/sh}" -lc ' + this.shellQuote(scanScript);
