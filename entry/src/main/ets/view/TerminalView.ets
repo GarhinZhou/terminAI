@@ -116,11 +116,22 @@ export struct TerminalView {
     return "'" + value.replace(/'/g, "'\"'\"'") + "'";
   }
 
+  /** Remote working-directory command; expands ~ / ~/… against the remote home. */
+  private remoteChangeDirectory(): string {
+    const cwd = this.session.cwd;
+    if (cwd.length === 0 || cwd === '~') {
+      return 'cd -- "$HOME"';
+    }
+    if (cwd.startsWith('~/')) {
+      return 'cd -- "$HOME/' + cwd.substring(2) + '"';
+    }
+    return 'cd -- ' + this.shellQuote(cwd);
+  }
+
   /** Build a real OpenSSH PTY command. Host input is validated when saved and quoted again here. */
   private remoteStartCommand(): string {
     const target = normalizedSshTarget(this.session.sshTarget);
-    const changeDirectory = this.session.cwd === '~' || this.session.cwd.length === 0 ?
-      'cd -- "$HOME"' : 'cd -- ' + this.shellQuote(this.session.cwd);
+    const changeDirectory = this.remoteChangeDirectory();
     // The local child is only `ssh`, so /proc/<child>/cwd cannot represent the
     // remote shell. A lightweight remote monitor follows the exec-stable shell
     // PID and emits a private OSC event whenever its directory changes.
@@ -137,7 +148,7 @@ export struct TerminalView {
       remoteScript += 'clear; "${SHELL:-/bin/sh}" -lc ' + this.shellQuote(this.session.cmd) +
         '; printf \'\\033]777;terminai-agent-returned\\007\'; exec "${SHELL:-/bin/sh}" -l';
     } else {
-      remoteScript += 'exec "${SHELL:-/bin/sh}" -l';
+      remoteScript += 'clear; exec "${SHELL:-/bin/sh}" -l';
     }
     return '/usr/bin/ssh -tt -o BatchMode=no -o ConnectTimeout=10 ' +
       '-o ServerAliveInterval=15 -o ServerAliveCountMax=3 ' +

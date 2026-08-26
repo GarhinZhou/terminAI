@@ -1293,7 +1293,11 @@ struct Index {
             this.newDialogCtrl.open();
           },
           onSelectSpace: (deviceId: string, cwd: string) => {
-            this.selectDevice(deviceId);
+            // Under "All Devices" keep showing everything; only switch the
+            // device filter when a specific device is already selected.
+            if (this.selectedDeviceId.length > 0) {
+              this.selectDevice(deviceId);
+            }
             const idx = this.sessions.findIndex((it: TerminalSession) =>
               it.deviceId === deviceId && canonicalSessionCwd(it) === cwd);
             if (idx >= 0) {
