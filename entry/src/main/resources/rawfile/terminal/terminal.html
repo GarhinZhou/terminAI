@@ -159,18 +159,6 @@
     }
   }
 
-  // Clipboard text captured on the right-click gesture; the native menu's
-  // "paste" has no Web user gesture, so it reuses this cache.
-  var cachedPaste = '';
-
-  function pasteFromMenu() {
-    if (cachedPaste) {
-      term.paste(cachedPaste);
-      return;
-    }
-    pasteClipboard();
-  }
-
   // Non-secure-context (rawfile://) fallback: focus a hidden contentEditable
   // and let the system paste into it, then forward the text to xterm.js.
   function execPasteFallback() {
@@ -222,17 +210,9 @@
   // Right-click is handled by the ArkUI native context menu; expose the
   // clipboard/selection actions it invokes.
   window.termCopySelection = copySelection;
-  window.termPasteClipboard = pasteFromMenu;
+  window.termPasteClipboard = pasteClipboard;
   window.termSelectAll = function () { term.selectAll(); };
-  document.addEventListener('contextmenu', function (e) {
-    e.preventDefault();
-    // Right-click is a Web user gesture: capture the clipboard for the menu's
-    // paste action (which has no gesture of its own).
-    if (!term.hasSelection() && navigator.clipboard && navigator.clipboard.readText) {
-      navigator.clipboard.readText().then(function (t) { cachedPaste = t || ''; })
-        .catch(function () { cachedPaste = ''; });
-    }
-  });
+  document.addEventListener('contextmenu', function (e) { e.preventDefault(); });
 })();
 </script>
 </body>
