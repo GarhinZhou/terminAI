@@ -308,13 +308,15 @@
       return true;
     }
     if (ctrl && !shift && !alt && !meta && e.key.toUpperCase() === 'V') {
-      pasteClipboard(); return false;
+      // Skip xterm's Ctrl+V control-character translation, but leave the
+      // browser default intact so its native paste event inserts text once.
+      return false;
     }
     if (ctrl && shift && !alt && !meta && e.key.toUpperCase() === 'C') {
       copySelection(); return false;
     }
     if (ctrl && shift && !alt && !meta && e.key.toUpperCase() === 'V') {
-      pasteClipboard(); return false;
+      return false;
     }
     if (ctrl && shift && !alt && !meta && e.key.toUpperCase() === 'A') {
       term.selectAll(); return false;
