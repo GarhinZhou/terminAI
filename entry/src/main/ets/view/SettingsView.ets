@@ -61,6 +61,8 @@ export struct SettingsView {
   @StorageLink('customAgents') customAgents: string = '';
   @StorageProp('isDark') isDark: boolean = true;
   @StorageProp('devicesEncoded') devicesEncoded: string = '';
+  @StorageProp('settingsTargetCustomAgent') settingsTargetCustomAgent: boolean = false;
+  @StorageProp('settingsTargetDevice') settingsTargetDevice: string = '';
   @State private tab: number = 0;
   @State private drafts: Map<string, string> = new Map();
   @State private customAgentItems: CustomAgentInfo[] = [];
@@ -68,6 +70,7 @@ export struct SettingsView {
   @State private customAgentCommand: string = '';
   @State private deviceOptions: ManagedDevice[] = [];
   @State private selectedDevice: string = LOCAL_DEVICE_ID;
+  private contentScroller: Scroller = new Scroller();
 
   private kinds: KindRow[] = [
     { kind: 'claude', label: 'Claude' },
@@ -94,8 +97,30 @@ export struct SettingsView {
 
   aboutToAppear(): void {
     this.deviceOptions = decodeDevices(this.devicesEncoded);
+    if (this.settingsTargetCustomAgent && this.deviceOptions.some((item: ManagedDevice) =>
+      item.id === this.settingsTargetDevice)) {
+      this.tab = 2;
+      this.selectedDevice = this.settingsTargetDevice;
+    } else if (!this.deviceOptions.some((item: ManagedDevice) => item.id === this.selectedDevice)) {
+      this.selectedDevice = LOCAL_DEVICE_ID;
+    }
     this.loadDrafts();
     this.loadCustomAgents();
+    if (this.settingsTargetCustomAgent) {
+      setTimeout(() => {
+        this.contentScroller.scrollEdge(Edge.Bottom);
+        setTimeout(() => { this.focusCustomAgentEditor(); }, 0);
+      }, 80);
+    }
+  }
+
+  private focusCustomAgentEditor(): void {
+    if (!this.settingsTargetCustomAgent || this.tab !== 2) return;
+    try {
+      this.getUIContext().getFocusController().requestFocus('settings_custom_agent_name');
+    } catch (error) {
+      console.error('TERMINAI focus custom agent editor failed: ' + JSON.stringify(error));
+    }
   }
 
   private loadDrafts(): void {
@@ -228,7 +253,7 @@ export struct SettingsView {
 
       Divider().color(Theme.divider(this.isDark)).strokeWidth(1)
 
-      Scroll() {
+      Scroll(this.contentScroller) {
         Column() {
           if (this.tab === 0) {
             // ── Appearance ──
@@ -617,6 +642,7 @@ export struct SettingsView {
               Column({ space: 8 }) {
                 TextInput({ text: this.customAgentName, placeholder: '智能体名称，例如 Qwen' })
                   .fontSize(14)
+                  .id('settings_custom_agent_name')
                   .height(34)
                   .width('100%')
                   .backgroundColor(Theme.button(this.isDark))
@@ -624,6 +650,9 @@ export struct SettingsView {
                   .placeholderColor(Theme.faintText(this.isDark))
                   .borderRadius(6)
                   .onChange((value: string) => { this.customAgentName = value; })
+                  .onVisibleAreaChange([1.0], (isVisible: boolean) => {
+                    if (isVisible) this.focusCustomAgentEditor();
+                  })
                 Row({ space: 8 }) {
                   TextInput({ text: this.customAgentCommand, placeholder: '可执行文件或启动命令' })
                     .fontSize(14)

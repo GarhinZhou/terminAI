@@ -24,6 +24,8 @@ import { SshCredentialStore } from '../model/SshCredentialStore';
 import { PendingRemoteSession, RemoteAgentInfo, SshConnectionState, SshRuntimeConnection,
   SshSecretValue, encodeConnectionStates, removeRemoteAgents,
   replaceRemoteAgents } from '../model/RemoteSshState';
+import { SavedSessionInfo, decodeSavedSessions,
+  encodeSavedSessions } from '../model/SessionPersistence';
 
 const SSH_CONNECTED_MARKER = '__TERMINAI_SSH_CONNECTED__';
 
@@ -75,12 +77,15 @@ const PREF_DEVICES = 'sshDevices';                // URI-encoded ManagedDevice r
 const PREF_SELECTED_DEVICE = 'selectedDevice';   // empty = all devices
 const PREF_REMOTE_AGENTS = 'remoteAgents';       // per-device scanned executable catalog
 const PREF_REMOTE_SHELLS = 'remoteShells';        // JSON {deviceId: loginShell}
+const PREF_LAST_PROGRAMS = 'lastProgramsByDevice';
+const PREF_SAVED_SESSIONS = 'savedSessions';
+const PREF_CURRENT_SESSION = 'currentSessionIndex';
 
 @Entry
 @Component
 struct Index {
   @State sessions: TerminalSession[] = [];
-  @State currentIdx: number = -1;
+  @State @Watch('onCurrentSessionChanged') currentIdx: number = -1;
   @State sidebarCollapsed: boolean = false;
   @State sidebarWidth: number = 280;
   @State defaultCwd: string = DEFAULT_CWD;
@@ -111,6 +116,7 @@ struct Index {
   @StorageProp('sshConnectionStates') sshConnectionStates: string = '';
   @StorageProp('recentPaths') recentPaths: string[] = [];
   // System color scheme, published by EntryAbility (onCreate + onConfigurationUpdate).
+  @StorageProp('lastProgramsByDevice') @Watch('onStyleChanged') lastProgramsByDevice: string = '';
   @StorageProp('sysDark') @Watch('onThemeModeChanged') sysDark: boolean = true;
   @StorageProp('titleButtonInset') titleButtonInset: number = 0;
   private ctrlDown: boolean = false;
@@ -124,6 +130,10 @@ struct Index {
   private sshConnections: SshRuntimeConnection[] = [];
   private mainWindow: window.Window | undefined = AppStorage.get<window.Window>('mainWindow');
   // Standard modal dialogs.
+  private sessionSaveTimer: number = -1;
+  private restoringSessions: boolean = false;
+  private savedSessionsEncoded: string = '';
+  private savedCurrentSessionIndex: number = -1;
   private newDialogCtrl: CustomDialogController = new CustomDialogController({
     builder: NewAgentDialog({
       onConfirm: (cwd: string, cmd: string, label: string, iconKind: string, deviceId: string) => {
@@ -133,6 +143,9 @@ struct Index {
           this.pushRecentPath(cwd);
         }
         this.newSession(cwd, cmd, label, iconKind, device);
+      },
+      onOpenCustomAgentSettings: (deviceId: string) => {
+        this.openCustomAgentSettings(deviceId);
       }
     }),
     customStyle: true,
@@ -193,6 +206,97 @@ struct Index {
     alignment: DialogAlignment.Center,
     autoCancel: true
   });
+  private openSettings(): void {
+    AppStorage.setOrCreate('settingsTargetCustomAgent', false);
+    this.settingsCtrl.open();
+  }
+
+  private openCustomAgentSettings(deviceId: string): void {
+    AppStorage.setOrCreate('settingsTargetDevice', deviceId);
+    AppStorage.setOrCreate('settingsTargetCustomAgent', true);
+    setTimeout(() => { this.settingsCtrl.open(); }, 80);
+  }
+
+  private terminalFocusId(session: TerminalSession): string {
+    return 'terminal_web_' + session.uid.toString();
+  }
+
+  onCurrentSessionChanged(): void {
+    this.saveSessionsSoon();
+    const session = this.currentIdx >= 0 && this.currentIdx < this.sessions.length ?
+      this.sessions[this.currentIdx] : null;
+    if (session === null) return;
+    setTimeout(() => {
+      try {
+        this.getUIContext().getFocusController().requestFocus(this.terminalFocusId(session));
+      } catch (error) {
+        console.error('TERMINAI focus selected session failed: ' + JSON.stringify(error));
+      }
+    }, 0);
+  }
+
+  private savedSessionInfo(session: TerminalSession): SavedSessionInfo {
+    return new SavedSessionInfo(session.cwd, session.cmd, session.agentKind,
+      session.agentIconKind, session.deviceId, session.name, session.manualTitle,
+      session.sequence, session.shellName);
+  }
+
+  private saveSessionsSoon(): void {
+    if (this.restoringSessions) return;
+    if (this.sessionSaveTimer >= 0) clearTimeout(this.sessionSaveTimer);
+    this.sessionSaveTimer = setTimeout(() => {
+      this.sessionSaveTimer = -1;
+      this.saveSessionsNow();
+    }, 80);
+  }
+
+  private saveSessionsNow(): void {
+    if (this.restoringSessions) return;
+    const items: SavedSessionInfo[] = [];
+    for (const session of this.mgr.sessions) {
+      items.push(this.savedSessionInfo(session));
+    }
+    for (const connection of this.sshConnections) {
+      for (const pending of connection.pendingSessions) {
+        items.push(new SavedSessionInfo(pending.cwd, pending.cmd, pending.label,
+          pending.iconKind, connection.deviceId, pending.title, pending.manualTitle,
+          pending.sequence > 0 ? pending.sequence : 1,
+          pending.shellName.length > 0 ? pending.shellName : 'sh'));
+      }
+    }
+    try {
+      const context = this.getUIContext().getHostContext();
+      if (context === undefined) return;
+      const store = preferences.getPreferencesSync(context, { name: PREF_NAME });
+      this.savedSessionsEncoded = encodeSavedSessions(items);
+      store.putSync(PREF_SAVED_SESSIONS, this.savedSessionsEncoded);
+      store.putSync(PREF_CURRENT_SESSION, this.currentIdx);
+      store.flush();
+    } catch (error) {
+      console.error('TERMINAI save sessions failed: ' + JSON.stringify(error));
+    }
+  }
+
+  private restoreSavedSessions(): boolean {
+    const items = decodeSavedSessions(this.savedSessionsEncoded);
+    if (items.length === 0) return false;
+    const devices = decodeDevices(this.devicesEncoded);
+    let restored = 0;
+    this.restoringSessions = true;
+    for (let index = 0; index < items.length; index++) {
+      const item = items[index];
+      const device = devices.find((candidate: ManagedDevice) => candidate.id === item.deviceId);
+      if (device === undefined) continue;
+      this.newSession(item.cwd, item.cmd, item.agentKind, item.iconKind, device,
+        item.shellName, item.title, item.manualTitle, item.sequence,
+        index === this.savedCurrentSessionIndex);
+      restored++;
+    }
+    this.restoringSessions = false;
+    if (restored > 0) this.saveSessionsSoon();
+    return restored > 0;
+  }
+
 
   aboutToAppear(): void {
     this.loadDefaultCwd();
@@ -219,7 +323,8 @@ struct Index {
         }
       }
     };
-    if (this.autoNewSession) {
+    const restoredSessions = this.restoreSavedSessions();
+    if (!restoredSessions && this.autoNewSession) {
       this.newSession();
     }
     // Auto-connect saved SSH hosts (best-effort, no password prompts).
@@ -287,6 +392,11 @@ struct Index {
       this.activityTimer = -1;
     }
     this.saveStylePrefs();
+    if (this.sessionSaveTimer >= 0) {
+      clearTimeout(this.sessionSaveTimer);
+      this.sessionSaveTimer = -1;
+    }
+    this.saveSessionsNow();
     for (const connection of [...this.sshConnections]) {
       this.disconnectDevice(connection.deviceId, true);
     }
@@ -793,12 +903,14 @@ struct Index {
       connection.openTerminalOnReady = false;
       return;
     }
-    const pending = connection.pendingSessions;
-    connection.pendingSessions = [];
-    for (const request of pending) {
-      const shellName = (request.cmd.length === 0 && request.label.length === 0) ?
+    while (connection.pendingSessions.length > 0) {
+      const request = connection.pendingSessions[0];
+      connection.pendingSessions.splice(0, 1);
+      const detectedShell = (request.cmd.length === 0 && request.label.length === 0) ?
         (connection.remoteShell.length > 0 ? connection.remoteShell : 'sh') : 'zsh';
-      this.newSession(request.cwd, request.cmd, request.label, request.iconKind, device, shellName);
+      const shellName = request.shellName.length > 0 ? request.shellName : detectedShell;
+      this.newSession(request.cwd, request.cmd, request.label, request.iconKind, device, shellName,
+        request.title, request.manualTitle, request.sequence, request.focusSession);
     }
     if (connection.openTerminalOnReady) {
       connection.openTerminalOnReady = false;
@@ -885,6 +997,9 @@ struct Index {
       const savedCustomAgents = store.getSync(PREF_CUSTOM_AGENTS, '') as string;
       const savedDevices = store.getSync(PREF_DEVICES, '') as string;
       const savedRemoteAgents = store.getSync(PREF_REMOTE_AGENTS, '') as string;
+      const savedLastPrograms = store.getSync(PREF_LAST_PROGRAMS, '') as string;
+      this.savedSessionsEncoded = store.getSync(PREF_SAVED_SESSIONS, '') as string;
+      this.savedCurrentSessionIndex = store.getSync(PREF_CURRENT_SESSION, -1) as number;
       let savedDeviceId = store.getSync(PREF_SELECTED_DEVICE, '') as string;
       if (savedDeviceId.length > 0 && !decodeDevices(savedDevices).some((item: ManagedDevice) =>
         item.id === savedDeviceId)) {
@@ -911,6 +1026,7 @@ struct Index {
       AppStorage.setOrCreate('selectedDeviceId', savedDeviceId);
       AppStorage.setOrCreate('remoteAgentsEncoded', savedRemoteAgents);
       // Restore persisted remote login shells (detected on first connection).
+      AppStorage.setOrCreate('lastProgramsByDevice', savedLastPrograms);
       try {
         const savedShells = store.getSync(PREF_REMOTE_SHELLS, '{}') as string;
         const shellMap = JSON.parse(savedShells) as Record<string, string>;
@@ -965,6 +1081,7 @@ struct Index {
       store.putSync(PREF_DEVICES, this.devicesEncoded);
       store.putSync(PREF_SELECTED_DEVICE, this.selectedDeviceId);
       store.putSync(PREF_REMOTE_AGENTS, this.remoteAgentsEncoded);
+      store.putSync(PREF_LAST_PROGRAMS, this.lastProgramsByDevice);
       store.flush();
     } catch (e) {
       console.error('TERMINAI save style prefs failed: ' + JSON.stringify(e));
@@ -1037,7 +1154,9 @@ struct Index {
   }
 
   private newSession(startCwd: string = '', cmd: string = '', label: string = '',
-    iconKind: string = '', device: ManagedDevice = localDevice(), shellName: string = ''): void {
+    iconKind: string = '', device: ManagedDevice = localDevice(), shellName: string = '',
+    restoredTitle: string = '', restoredManualTitle: boolean = false,
+    preferredSequence: number = 0, focusSession: boolean = true): void {
     const cwd = startCwd.length > 0 ? startCwd : (device.isLocal() ? this.defaultCwd : '~');
     let finalShell = shellName.length > 0 ? shellName : (device.isLocal() ? 'zsh' : 'sh');
     // For remote terminals the login shell is the host's $SHELL (e.g. bash);
@@ -1058,7 +1177,9 @@ struct Index {
         this.publishSshStates();
       }
       if (!connection.isReady()) {
-        connection.pendingSessions.push(new PendingRemoteSession(cwd, cmd, label, iconKind));
+        connection.pendingSessions.push(new PendingRemoteSession(cwd, cmd, label, iconKind,
+          restoredTitle, restoredManualTitle, preferredSequence, finalShell, focusSession));
+        this.saveSessionsSoon();
         this.connectDevice(device, false).catch(() => {});
         return;
       }
@@ -1066,7 +1187,11 @@ struct Index {
       knownHostsPath = this.connectionFilePath(device.id, '-known-hosts');
     }
     const s = this.mgr.newSession(cwd, cmd, label, iconKind, device.id, device.name,
-      device.sshTarget, controlPath, knownHostsPath, finalShell);
+      device.sshTarget, controlPath, knownHostsPath, finalShell, preferredSequence);
+    if (restoredTitle.length > 0) {
+      s.name = restoredTitle;
+      s.manualTitle = restoredManualTitle;
+    }
     s.onStateChanged = () => {
       if (!s.alive) {
         // session exited: notify only if user isn't looking at it
@@ -1079,12 +1204,17 @@ struct Index {
       // Keep exited sessions visible until the user closes them so the
       // "会话已退出" state remains truthful and recoverable.
       this.sessions = [...this.sessions];
+      this.saveSessionsSoon();
     };
     s.onCwdChanged = () => {
       this.sessions = [...this.sessions];
+      this.saveSessionsSoon();
     };
     this.sessions = [...this.mgr.sessions];
-    this.currentIdx = this.sessions.length - 1;
+    if (focusSession || this.currentIdx < 0) {
+      this.currentIdx = this.sessions.length - 1;
+    }
+    this.saveSessionsSoon();
   }
 
   private closeSession(s: TerminalSession): void {
@@ -1096,6 +1226,7 @@ struct Index {
     } else if (idx >= this.sessions.length) {
       this.currentIdx = this.sessions.length - 1;
     }
+    this.saveSessionsSoon();
   }
 
   private programLabel(s: TerminalSession): string {
@@ -1249,6 +1380,8 @@ struct Index {
       .height('100%')
       .layoutWeight(1)
       .padding({ left: this.sidebarCollapsed ? 6 : 16, right: 10 })
+      .focusable(true)
+      .focusOnTouch(true)
       .onTouch((event: TouchEvent) => {
         this.handleTitleTouch(event);
       })
@@ -1402,8 +1535,9 @@ struct Index {
             s.markManualTitle();
             s.name = this.capitalizeSessionName(name);
             this.sessions = [...this.sessions];
+            this.saveSessionsSoon();
           },
-          onOpenSettings: () => { this.settingsCtrl.open(); },
+          onOpenSettings: () => { this.openSettings(); },
           onOpenDevices: () => { this.deviceCtrl.open(); },
           onCollapse: () => {
             this.getUIContext().animateTo({ duration: 200, curve: Curve.EaseOut },

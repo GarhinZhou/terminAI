@@ -57,6 +57,7 @@ export struct SidebarView {
 
   @State private renamingIdx: number = -1;
   @State private renameText: string = '';
+  @State private renameInputHovered: boolean = false;
   @State private selectedSpace: string = '';
   /** Keep only a stable primitive in V1 state; resolve the row again when a menu action fires. */
   @State private menuSessionUid: number = -1;
@@ -314,6 +315,20 @@ export struct SidebarView {
   private beginRename(session: TerminalSession): void {
     this.renamingIdx = this.sessions.indexOf(session);
     this.renameText = session.name;
+    setTimeout(() => { this.focusRenameInput(session); }, 0);
+  }
+
+  private renameInputId(session: TerminalSession): string {
+    return 'session_rename_' + session.uid.toString();
+  }
+
+  private focusRenameInput(session: TerminalSession): void {
+    if (this.renamingIdx !== this.sessions.indexOf(session)) return;
+    try {
+      this.getUIContext().getFocusController().requestFocus(this.renameInputId(session));
+    } catch (error) {
+      console.error('TERMINAI focus rename input failed: ' + JSON.stringify(error));
+    }
   }
 
   private menuSession(): TerminalSession | null {
@@ -661,8 +676,6 @@ export struct SidebarView {
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
             .constraintSize({ maxWidth: Math.max(80, this.sidebarWidth - 100) })
-          SessionNumberBadge({ value: item.sequence, isDark: this.isDark })
-            .margin({ left: 6 })
           Blank()
           Text(item.activityState)
             .fontSize(10)
@@ -756,8 +769,7 @@ export struct SidebarView {
     .onTouch((event: TouchEvent) => { this.onTouchFeedback(this.sessionKey('agent_', item), event); })
     .onClick(() => { this.onSelectSession(item.uid); })
     .bindContextMenu(this.contextMenuBuilder, ResponseType.RightClick)
-    .accessibilityText(item.name + ' ' + item.sequence.toString() + '，' +
-      this.programLabel(item) + '，空间 ' +
+    .accessibilityText(item.name + '，' + this.programLabel(item) + '，空间 ' +
       this.displayCwd(item.cwd) + '，运行状态 ' + item.activityState)
     .accessibilitySelected(this.isSessionSelected(item))
   }
@@ -824,7 +836,8 @@ export struct SidebarView {
 
   @Builder
   renamingRow(item: TerminalSession) {
-    TextInput({ text: item.name })
+    TextInput({ text: this.renameText })
+      .id(this.renameInputId(item))
       .defaultFocus(true)
       .fontSize(14)
       .height(36)
@@ -836,13 +849,20 @@ export struct SidebarView {
       .padding({ left: 8, right: 8 })
       .margin({ left: 8, right: 6, bottom: 4 })
       .onChange((value: string) => { this.renameText = value; })
+      .onHover((isHover: boolean) => { this.renameInputHovered = isHover; })
+      .onVisibleAreaChange([1.0], (isVisible: boolean) => {
+        if (isVisible) this.focusRenameInput(item);
+      })
       .onSubmit(() => {
         if (this.renameText.trim().length > 0) {
           this.onRenameSession(item, this.renameText.trim());
         }
         this.renamingIdx = -1;
       })
-      .onBlur(() => { this.renamingIdx = -1; })
+      .onBlur(() => {
+        this.renamingIdx = -1;
+        this.renameInputHovered = false;
+      })
   }
 
   @Builder
@@ -1106,5 +1126,13 @@ export struct SidebarView {
     .width(this.sidebarWidth)
     .height('100%')
     .backgroundColor(Theme.panel(this.isDark))
+    .focusable(true)
+    .focusOnTouch(true)
+    .onMouse((event: MouseEvent) => {
+      if (this.renamingIdx >= 0 && !this.renameInputHovered &&
+        event.button === MouseButton.Left && event.action === MouseAction.Press) {
+        this.renamingIdx = -1;
+      }
+    })
   }
 }

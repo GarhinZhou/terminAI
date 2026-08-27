@@ -9,6 +9,7 @@ import { CustomAgentInfo, decodeCustomAgents } from '../model/CustomAgent';
 import { remoteAgentsForDevice } from '../model/RemoteSshState';
 import { overridesForDevice } from '../model/AgentOverrides';
 import { LOCAL_DEVICE_ID, decodeDevices, ManagedDevice } from '../model/ManagedDevice';
+import { programForDevice, setProgramForDevice } from '../model/DeviceProgramPreference';
 
 /** An executable discovered on PATH (shell or coding-agent CLI). */
 class ProgramInfo {
@@ -27,6 +28,7 @@ class ProgramInfo {
 export struct NewAgentDialog {
   controller?: CustomDialogController;
   onConfirm: (cwd: string, cmd: string, label: string, iconKind: string, deviceId: string) => void = () => {};
+  onOpenCustomAgentSettings: (deviceId: string) => void = () => {};
 
   @StorageLink('defaultCwd') cwd: string = '~';
   @StorageProp('recentPaths') recentPaths: string[] = [];
@@ -38,6 +40,7 @@ export struct NewAgentDialog {
   @StorageProp('agentOverrides') agentOverrides: string = '';
   @StorageProp('customAgents') customAgents: string = '';
   @StorageProp('accent') accent: string = '';
+  @StorageLink('lastProgramsByDevice') lastProgramsByDevice: string = '';
   @StorageProp('selectedDeviceId') selectedDeviceId: string = '';
   @StorageProp('remoteAgentsEncoded') remoteAgentsEncoded: string = '';
   @StorageProp('devicesEncoded') devicesEncoded: string = '';
@@ -74,20 +77,27 @@ export struct NewAgentDialog {
   }
 
   private refreshPrograms(): void {
-    this.selectedIdx = 0;
     if (this.chosenDeviceTarget.length > 0) {
       this.programs = this.remotePrograms();
-      if (this.defaultProgram.length > 0) {
-        const selected = this.programs.findIndex((item: ProgramInfo) => item.name === this.defaultProgram);
-        if (selected >= 0) this.selectedIdx = selected;
+    } else {
+      this.programs = this.localPrograms();
+    }
+    this.selectedIdx = 0;
+    const remembered = programForDevice(this.lastProgramsByDevice, this.chosenDeviceId);
+    const preferred = remembered.length > 0 ? remembered : this.defaultProgram;
+    if (preferred.length > 0) {
+      const selected = this.programs.findIndex((item: ProgramInfo) => item.name === preferred);
+      if (selected >= 0) {
+        this.selectedIdx = selected;
       }
-      return;
     }
-    this.programs = this.localPrograms();
-    if (this.defaultProgram.length > 0) {
-      const di = this.programs.findIndex((p: ProgramInfo) => p.name === this.defaultProgram);
-      if (di >= 0) this.selectedIdx = di;
-    }
+  }
+
+  private selectProgram(idx: number): void {
+    if (idx < 0 || idx >= this.programs.length) return;
+    this.selectedIdx = idx;
+    this.lastProgramsByDevice = setProgramForDevice(this.lastProgramsByDevice,
+      this.chosenDeviceId, this.programs[idx].name);
   }
 
   private localPrograms(): ProgramInfo[] {
@@ -177,6 +187,7 @@ export struct NewAgentDialog {
   private confirm(): void {
     if (this.cwd.trim().length === 0) return;
     // Index 0 is always the default login shell for the selected device.
+    this.selectProgram(this.selectedIdx);
     if (this.selectedIdx === 0) {
       this.onConfirm(this.cwd.trim(), '', '', '', this.chosenDeviceId);
     } else {
@@ -184,6 +195,12 @@ export struct NewAgentDialog {
       this.onConfirm(this.cwd.trim(), p.path, p.name, p.iconKind, this.chosenDeviceId);
     }
     this.controller?.close();
+  }
+
+
+  private openCustomAgentSettings(): void {
+    this.controller?.close();
+    this.onOpenCustomAgentSettings(this.chosenDeviceId);
   }
 
   private async pickDirectory(): Promise<void> {
@@ -245,9 +262,35 @@ export struct NewAgentDialog {
     .border({ width: this.selectedIdx === idx ? 1.5 : 0, color: this.accentOf(), radius: 9 })
     .margin({ right: 8, bottom: 8 })
     .onHover((isHover: boolean) => { this.hoveredProgram = isHover ? p.name : ''; })
-    .onClick(() => { this.selectedIdx = idx; })
+    .onClick(() => { this.selectProgram(idx); })
     .accessibilityText(p.name)
     .accessibilitySelected(this.selectedIdx === idx)
+  }
+
+  @Builder
+  customAgentCell() {
+    Column() {
+      UiIcon({ name: IconName.NewAgent, iconSize: 20, color: this.accentOf() })
+      Text('自定义智能体')
+        .fontSize(13)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(this.accentOf())
+        .maxLines(1)
+        .margin({ top: 6 })
+    }
+    .width('23%')
+    .height(64)
+    .justifyContent(FlexAlign.Center)
+    .borderRadius(9)
+    .backgroundColor(this.hoveredProgram === '__custom__' ?
+      Theme.hover(this.isDark) : Theme.input(this.isDark))
+    .border({ width: 1, color: Theme.accentWash(this.isDark), radius: 9 })
+    .margin({ right: 8, bottom: 8 })
+    .onHover((isHover: boolean) => {
+      this.hoveredProgram = isHover ? '__custom__' : '';
+    })
+    .onClick(() => { this.openCustomAgentSettings(); })
+    .accessibilityText('为' + this.chosenDeviceName + '添加自定义智能体')
   }
 
   @Builder
@@ -322,6 +365,7 @@ export struct NewAgentDialog {
           ForEach(this.programs, (p: ProgramInfo, idx: number) => {
             this.kindCell(p, idx)
           }, (p: ProgramInfo) => p.name + '_' + p.path)
+          this.customAgentCell()
         }
         .width('100%')
 

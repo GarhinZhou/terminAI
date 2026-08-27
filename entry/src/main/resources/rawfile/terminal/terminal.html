@@ -327,6 +327,15 @@
   window.termCopySelection = copySelection;
   window.termPasteClipboard = pasteClipboard;
   window.termSelectAll = function () { term.selectAll(); };
+  // Chromium maps Ctrl+wheel to page zoom. Terminal font size is controlled
+  // only from terminAI settings, so consume that gesture without changing the
+  // normal terminal scrollback behavior.
+  document.addEventListener('wheel', function (event) {
+    if (!event.ctrlKey) return;
+    event.preventDefault();
+    event.stopPropagation();
+  }, { passive: false, capture: true });
+
   document.addEventListener('contextmenu', function (e) { e.preventDefault(); });
 })();
 </script>

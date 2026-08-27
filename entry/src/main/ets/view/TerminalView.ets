@@ -231,6 +231,25 @@ export struct TerminalView {
     this.controller.runJavaScript('window.termSetScrollback(' + this.scrollback + ')').catch(() => {});
   }
 
+  private terminalFocusId(): string {
+    return 'terminal_web_' + this.session.uid.toString();
+  }
+
+  private focusTerminalInput(): void {
+    if (!this.active || !this.pageReady) return;
+    try {
+      this.getUIContext().getFocusController().requestFocus(this.terminalFocusId());
+    } catch (error) {
+      console.error('TERMINAI focus terminal Web failed: ' + JSON.stringify(error));
+    }
+    this.controller.runJavaScript('window.termFitNow(); window.termFocus()').catch(() => {});
+  }
+
+  private scheduleTerminalFocus(): void {
+    if (!this.active || !this.pageReady) return;
+    setTimeout(() => { this.focusTerminalInput(); }, 0);
+  }
+
   onActiveChanged(): void {
     if (!this.active) {
       return;
@@ -253,7 +272,7 @@ export struct TerminalView {
         this.replayNeeded = true;
       }
       this.scheduleTerminalRender();
-      this.controller.runJavaScript('window.termFitNow(); window.termFocus()').catch(() => {});
+      this.scheduleTerminalFocus();
     }
   }
 
@@ -552,7 +571,7 @@ export struct TerminalView {
     this.session.startInProgress = false;
     console.info('TERMINAI startNativeSession: session created id=' + id);
     if (this.active) {
-      this.controller.runJavaScript('window.termFocus()').catch(() => {});
+      this.scheduleTerminalFocus();
     }
   }
 
@@ -666,6 +685,7 @@ export struct TerminalView {
           this.controller.runJavaScript('window.termFitNow()').catch(() => {});
         }
         this.scheduleTerminalRender();
+        if (this.active) this.scheduleTerminalFocus();
       })
       .onErrorReceive((e) => {
         if (!e.request.isMainFrame()) {
@@ -686,6 +706,12 @@ export struct TerminalView {
         return true;
       })
       .width('100%')
+      .id(this.terminalFocusId())
+      .focusable(true)
+      .focusOnTouch(true)
+      .onVisibleAreaChange([1.0], (isVisible: boolean) => {
+        if (isVisible && this.active) this.scheduleTerminalFocus();
+      })
       .height('100%')
       .backgroundColor(Theme.terminalBg(this.isDark))
       .bindContextMenu(this.termMenuBuilder, ResponseType.RightClick)

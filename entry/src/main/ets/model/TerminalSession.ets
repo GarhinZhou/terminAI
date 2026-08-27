@@ -77,6 +77,7 @@ export class TerminalSession {
   private recentText: string = '';
   private screenText: string = '';
   private privateSignalTail: string = '';
+  private titleSignalTail: string = '';
   private observedAgentProcess: boolean = false;
   private explicitReturnedShell: boolean = false;
   /** Bounded raw PTY history used to restore an ArkWeb page after hiding or reload. */
@@ -158,6 +159,53 @@ export class TerminalSession {
     if (this.name !== title) {
       this.name = title;
       this.onStateChanged();
+    }
+  }
+
+  /** Parse OSC 0/2 titles directly from PTY output before ArkWeb finishes rendering it. */
+  private trackTerminalTitles(data: string): void {
+    let remaining = this.titleSignalTail + data;
+    this.titleSignalTail = '';
+    let searchFrom = 0;
+    for (;;) {
+      const start = remaining.indexOf('\x1B]', searchFrom);
+      if (start < 0) {
+        const escape = remaining.lastIndexOf('\x1B');
+        if (escape >= 0) {
+          const possiblePrefix = remaining.substring(escape);
+          if ('\x1B]'.startsWith(possiblePrefix)) {
+            this.titleSignalTail = possiblePrefix;
+          }
+        }
+        return;
+      }
+      const separator = remaining.indexOf(';', start + 2);
+      if (separator < 0) {
+        this.titleSignalTail = remaining.substring(start).slice(-4096);
+        return;
+      }
+      const code = remaining.substring(start + 2, separator);
+      if (code !== '0' && code !== '2') {
+        searchFrom = separator + 1;
+        continue;
+      }
+      const bellEnd = remaining.indexOf('\x07', separator + 1);
+      const stringEnd = remaining.indexOf('\x1B\\', separator + 1);
+      let end = -1;
+      let terminatorLength = 1;
+      if (bellEnd >= 0 && (stringEnd < 0 || bellEnd < stringEnd)) {
+        end = bellEnd;
+      } else if (stringEnd >= 0) {
+        end = stringEnd;
+        terminatorLength = 2;
+      }
+      if (end < 0) {
+        this.titleSignalTail = remaining.substring(start).slice(-4096);
+        return;
+      }
+      this.updateTerminalTitle(remaining.substring(separator + 1, end));
+      remaining = remaining.substring(end + terminatorLength);
+      searchFrom = 0;
     }
   }
 
@@ -421,6 +469,7 @@ export class TerminalSession {
       return;
     }
     if (ev.kind === 'output') {
+      this.trackTerminalTitles(ev.data);
       this.appendOutputHistory(ev.data);
       this.trackPrivateSignals(ev.data);
       this.lastOutputAt = Date.now();
@@ -463,7 +512,11 @@ export class SessionManager {
   /** Called from native TSFN. Must find session and dispatch. */
   dispatch: (ev: SessionEvent) => void = () => {};
 
-  private nextSequence(typeKey: string): number {
+  private nextSequence(typeKey: string, preferredSequence: number): number {
+    if (preferredSequence > 0 && !this.sessions.some((item: TerminalSession) =>
+      item.typeKey === typeKey && item.sequence === preferredSequence)) {
+      return preferredSequence;
+    }
     let candidate = 1;
     while (this.sessions.some((item: TerminalSession) =>
       item.typeKey === typeKey && item.sequence === candidate)) {
@@ -482,11 +535,12 @@ export class SessionManager {
   newSession(startCwd: string = '~',
     cmd: string = '', label: string = '', iconKind: string = '', deviceId: string = 'local',
     deviceName: string = '本机', sshTarget: string = '', sshControlPath: string = '',
-    sshKnownHostsPath: string = '', shellName: string = 'zsh'): TerminalSession {
+    sshKnownHostsPath: string = '', shellName: string = 'zsh',
+    preferredSequence: number = 0): TerminalSession {
     this.uidCounter++;
     const base = label.length > 0 ? label : shellName;
     const counterKey = base.toLowerCase();
-    const nextCount = this.nextSequence(counterKey);
+    const nextCount = this.nextSequence(counterKey, preferredSequence);
     const s = new TerminalSession(this.capitalizeName(base), nextCount);
     s.uid = this.uidCounter;
     s.typeKey = counterKey;

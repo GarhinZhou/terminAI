@@ -37,12 +37,24 @@ export class PendingRemoteSession {
   cmd: string = '';
   label: string = '';
   iconKind: string = '';
+  title: string = '';
+  manualTitle: boolean = false;
+  sequence: number = 0;
+  shellName: string = '';
+  focusSession: boolean = true;
 
-  constructor(cwd: string, cmd: string, label: string, iconKind: string) {
+  constructor(cwd: string, cmd: string, label: string, iconKind: string,
+    title: string = '', manualTitle: boolean = false, sequence: number = 0,
+    shellName: string = '', focusSession: boolean = true) {
     this.cwd = cwd;
     this.cmd = cmd;
     this.label = label;
     this.iconKind = iconKind;
+    this.title = title;
+    this.manualTitle = manualTitle;
+    this.sequence = sequence;
+    this.shellName = shellName;
+    this.focusSession = focusSession;
   }
 }
 
