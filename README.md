@@ -16,11 +16,24 @@
 terminAI 将终端、CLI 智能体、工作空间和 SSH 设备组织在同一个 HarmonyOS PC 窗口中。项目界面与工作流参考 herdrm，使用 ArkUI 实现桌面界面，以 ArkWeb + xterm.js 渲染终端，并通过原生 PTY 层启动本机 Shell、智能体和 SSH 会话。
 
 > [!IMPORTANT]
-> 项目目前处于开发阶段，仅配置了 HarmonyOS `2in1` 设备。仓库中的构建配置包含受限 ACL 权限，普通自动签名无法直接生成可安装包；自行构建时需要为自己的应用申请相应权限并配置证书与 Profile。
+> 项目目前处于开发阶段，仅配置了 HarmonyOS `2in1` 设备。Release 提供的是未签名 HAP，不能直接安装；调试时需要使用包含目标设备 UDID 和项目所需 ACL 权限的调试 Profile 完成签名。
 
 ## 下载
 
-构建产物可从 [GitHub Releases](https://github.com/GarhinZhou/terminAI/releases) 下载。公开 Release 不会包含个人调试 Profile；标记为 `unsigned` 的 HAP 需要使用与应用包名、ACL 权限和目标设备匹配的证书与 Profile 签名后才能安装。
+构建产物可从 [GitHub Releases](https://github.com/GarhinZhou/terminAI/releases) 下载。公开 Release 不包含私钥、个人调试 Profile 或设备 UDID；标记为 `unsigned` 的 HAP 需要使用与应用包名、ACL 权限和目标设备匹配的证书与 Profile 签名后才能安装。
+
+## 使用小白调试助手安装 unsigned HAP
+
+推荐使用 [小白调试助手（Auto-Installer）](https://github.com/likuai2010/auto-installer) 为 Release 中的 unsigned HAP 生成调试签名并安装。它支持 HarmonyOS、Windows、macOS、Linux 和 Android；根据其项目说明，HarmonyOS 版助手本身首次安装时需要借助其他受支持平台。
+
+1. 从本仓库 [Releases](https://github.com/GarhinZhou/terminAI/releases) 下载名称中带有 `unsigned` 的 HAP。
+2. 从小白调试助手仓库下载适合当前平台的版本并启动。使用 HarmonyOS PC 本机版时，需要先让调试助手自身完成安装。
+3. 在目标 HarmonyOS 设备上启用“开发者选项”和“无线调试”，然后在调试助手中添加并连接该设备。
+4. 在调试助手中选择下载的 unsigned HAP。工具会读取应用包名、设备信息和 HAP 声明的 ACL 权限，并按照界面提示获取匹配的调试 Profile、完成本地签名和安装。
+5. 安装完成后即可在目标设备启动 terminAI。后续更换设备或 HAP 新增 ACL 权限时，需要重新生成匹配的调试 Profile 并签名。
+
+> [!WARNING]
+> 调试 Profile 与应用包名、证书、ACL 和目标设备绑定。工具生成的已签名 HAP 只应用于个人开发调试，不要将其中包含设备信息的调试 Profile 或签名包再次公开分发。小白调试助手是第三方工具，使用前请自行阅读其说明并评估信任风险。
 
 ## 主要功能
 
@@ -112,9 +125,18 @@ devecocli run --device <设备序列号>
 | `ohos.permission.FILE_ACCESS_PERSIST` | 保持用户授权的文件访问 |
 | `ohos.permission.READ_WRITE_USER_FILE` | 读写用户选择的文件与目录 |
 | `ohos.permission.ACCESS_USER_FULL_DISK` | 访问终端工作目录所需的用户磁盘范围 |
-| `ohos.permission.CUSTOM_SANDBOX` | 为终端进程配置自定义沙箱能力 |
+| `ohos.permission.READ_PASTEBOARD` | 将系统剪贴板内容粘贴到终端会话 |
+| `ohos.permission.CUSTOM_SANDBOX` | 为本机 PTY 和 Shell 进程启用项目所需的自定义沙箱配置 |
 
 其中多项属于受限 ACL 权限。用于正式上架的 Release Profile 必须包含实际获批的权限；不要直接复用个人调试证书或含设备 UDID 的调试 Profile 对外分发。
+
+## 为什么当前版本不能上架华为应用市场
+
+terminAI 的本机终端架构依赖 `ohos.permission.CUSTOM_SANDBOX`。该权限是 `system_basic` 级 ACL，但目前不属于普通第三方应用可以按公开场景申请并获得发布审批的权限，因此无法为应用市场版本取得包含它的发布 Profile。调试工具能够生成包含该 ACL、绑定测试设备的调试 Profile，并不代表应用获得了正式发布授权。
+
+如果删除 `CUSTOM_SANDBOX`，进程会回到权限较低的普通应用沙箱。本项目实测会出现预期的 `zsh` 环境无法正常启动、实际退回 `sh`，且 Shell 可访问的命令、文件和系统能力明显受限，终端与本地 CLI 智能体的核心功能因此无法可靠工作。基于当前架构，保留该 ACL 就不能按普通第三方应用流程上架，删除它又会破坏核心能力。
+
+如果未来平台开放相应的正式申请场景，或者项目改为不依赖自定义沙箱的远程执行/官方扩展架构，可以重新评估应用市场发布。其他受限 ACL 仍需分别按实际使用场景提交审核。
 
 ## 项目目录
 

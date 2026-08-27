@@ -10,3 +10,9 @@
 /.bitfun
 # 验证截图
 .terminai-check/
+
+# 本机调试、签名与临时分析文件
+.terminai-temp/
+.hvigor-debug.log
+*.p12
+*.p7b
