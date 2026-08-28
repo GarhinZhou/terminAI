@@ -96,6 +96,10 @@ export struct TerminalView {
   private replayInFlight: boolean = false;
   private liveWriteInFlight: boolean = false;
   private liveWriteGeneration: number = 0;
+  private outputOwner: TerminalSession | null = null;
+  private outputHandler: (data: string) => void = (data: string) => {
+    this.queueTerminalOutput(data);
+  };
 
   private isApplicationShortcut(keyCode: number): boolean {
     return keyCode === KEYCODE_K || keyCode === KEYCODE_T || keyCode === KEYCODE_W ||
@@ -516,9 +520,8 @@ export struct TerminalView {
   }
 
   aboutToAppear(): void {
-    this.session.onOutput = (data: string) => {
-      this.queueTerminalOutput(data);
-    };
+    this.outputOwner = this.session;
+    this.outputOwner.onOutput = this.outputHandler;
   }
 
 
@@ -530,7 +533,12 @@ export struct TerminalView {
     this.outputPortRetryScheduled = false;
     this.rendererReloadScheduled = false;
     this.closeOutputPort();
-    this.session.onOutput = () => {};
+    // A replacement view may already own this session while ArkUI disposes
+    // the old Web node. Never let the old node detach the new output route.
+    if (this.outputOwner !== null && this.outputOwner.onOutput === this.outputHandler) {
+      this.outputOwner.onOutput = () => {};
+    }
+    this.outputOwner = null;
   }
   private async createNativeSession(cols: number, rows: number, nativeCwd: string,
     nativeCommand: string): Promise<void> {

@@ -1218,13 +1218,27 @@ struct Index {
   }
 
   private closeSession(s: TerminalSession): void {
-    const idx = this.sessions.indexOf(s);
+    const closingIndex = this.sessions.indexOf(s);
+    if (closingIndex < 0) {
+      return;
+    }
+    const selected = this.currentSession();
+    const selectedUid = selected === null ? -1 : selected.uid;
     this.mgr.remove(s);
     this.sessions = [...this.mgr.sessions];
     if (this.sessions.length === 0) {
       this.currentIdx = -1;
-    } else if (idx >= this.sessions.length) {
-      this.currentIdx = this.sessions.length - 1;
+    } else if (selectedUid >= 0 && selectedUid !== s.uid) {
+      const preservedIndex = this.sessions.findIndex((item: TerminalSession) => item.uid === selectedUid);
+      if (preservedIndex >= 0) {
+        this.currentIdx = preservedIndex;
+      } else {
+        this.currentIdx = Math.min(closingIndex, this.sessions.length - 1);
+      }
+    } else {
+      // When the selected session is closed, prefer the item that moved into
+      // the same position, or the previous item when the last one was closed.
+      this.currentIdx = Math.min(closingIndex, this.sessions.length - 1);
     }
     this.saveSessionsSoon();
   }
@@ -1265,6 +1279,12 @@ struct Index {
       return this.sessions[this.currentIdx];
     }
     return null;
+  }
+
+  /** Compare by stable identity; array indexes shift whenever a preceding session closes. */
+  private isCurrentSession(session: TerminalSession): boolean {
+    const current = this.currentSession();
+    return current !== null && current.uid === session.uid;
   }
 
   private titleSidebarBackground(): string {
@@ -1556,11 +1576,11 @@ struct Index {
 
           // Terminal stack: all sessions mounted, only current visible.
           Stack() {
-            ForEach(this.sessions, (s: TerminalSession, idx: number) => {
+            ForEach(this.sessions, (s: TerminalSession) => {
               Column() {
                 TerminalView({
                   session: s,
-                  active: idx === this.currentIdx,
+                  active: this.isCurrentSession(s),
                   onEvent: (ev: SessionEvent) => this.mgr.dispatch(ev),
                   onShortcut: (keyCode: number, shift: boolean) => {
                     this.handleAppShortcut(keyCode, shift);
@@ -1570,8 +1590,8 @@ struct Index {
               .width('100%')
               .height('100%')
               .padding({ left: 10, right: 10, top: 8, bottom: 8 })
-              .visibility(idx === this.currentIdx ? Visibility.Visible : Visibility.Hidden)
-            }, (s: TerminalSession, idx: number) => 'term_' + s.uid)
+              .visibility(this.isCurrentSession(s) ? Visibility.Visible : Visibility.Hidden)
+            }, (s: TerminalSession) => 'term_' + s.uid.toString())
 
             if (this.sessions.length === 0) {
               Column() {
