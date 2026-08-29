@@ -64,11 +64,17 @@ export const resizeSession: (id: number, cols: number, rows: number) => boolean;
 /** Kill the session (SIGHUP to process group) and release resources. */
 export const killSession: (id: number) => boolean;
 
+/** Remove immediately, then stop the process and join native workers off the ArkUI thread. */
+export const killSessionAsync: (id: number) => Promise<boolean>;
+
 /** List all known sessions. */
 export const listSessions: () => SessionInfo[];
 
 /** Inspect the foreground process group used by the activity state machine. */
 export const inspectSession: (id: number) => SessionProcessInfo;
+
+/** Inspect without blocking the ArkUI thread on /proc traversal. */
+export const inspectSessionAsync: (id: number) => Promise<SessionProcessInfo>;
 
 /** Probe well-known PATH dirs for shells / coding-agent CLIs. */
 export const listPrograms: () => ProgramInfo[];

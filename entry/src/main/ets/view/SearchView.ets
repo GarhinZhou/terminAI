@@ -12,7 +12,7 @@ const KEYCODE_ESCAPE = 2070;
 
 class SearchEntry {
   id: string = '';
-  idx: number = 0;
+  uid: number = -1;
   name: string = '';
   sequence: number = 0;
   kind: string = '';
@@ -27,7 +27,7 @@ class SearchEntry {
 export struct SearchView {
   controller?: CustomDialogController;
   getSessions: () => TerminalSession[] = () => [];
-  onPick: (idx: number) => void = () => {};
+  onPick: (uid: number) => void = () => {};
   onPickSpace: (cwd: string, deviceId: string) => void = () => {};
 
   @State private query: string = '';
@@ -72,7 +72,7 @@ export struct SearchView {
       }
       const entry = new SearchEntry();
       entry.id = 'session_' + session.uid.toString();
-      entry.idx = index;
+      entry.uid = session.uid;
       entry.name = session.name;
       entry.sequence = session.sequence;
       entry.kind = this.programLabel(session);
@@ -97,7 +97,7 @@ export struct SearchView {
       seen.push(spaceKey);
       const entry = new SearchEntry();
       entry.id = 'space_' + spaceKey;
-      entry.idx = -1;
+      entry.uid = -1;
       entry.name = this.displayCwd(canonicalCwd);
       entry.space = canonicalCwd;
       entry.deviceId = session.deviceId;
@@ -112,7 +112,7 @@ export struct SearchView {
     if (entry.isSpace) {
       this.onPickSpace(entry.space, entry.deviceId);
     } else {
-      this.onPick(entry.idx);
+      this.onPick(entry.uid);
     }
     this.controller?.close();
   }

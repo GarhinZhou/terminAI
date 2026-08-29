@@ -30,6 +30,34 @@ export enum AgentRunState {
   Unknown = '状态未知'
 }
 
+/** One bounded slice from the session-owned output ring. */
+export class TerminalOutputSlice {
+  startCursor: number;
+  endCursor: number;
+  data: string;
+  cursorWasTrimmed: boolean;
+
+  constructor(startCursor: number, endCursor: number, data: string, cursorWasTrimmed: boolean) {
+    this.startCursor = startCursor;
+    this.endCursor = endCursor;
+    this.data = data;
+    this.cursorWasTrimmed = cursorWasTrimmed;
+  }
+}
+
+/** Stable recovery payload plus the absolute output cursor it represents. */
+export class TerminalOutputSnapshot {
+  startCursor: number;
+  endCursor: number;
+  data: string;
+
+  constructor(startCursor: number, endCursor: number, data: string) {
+    this.startCursor = startCursor;
+    this.endCursor = endCursor;
+    this.data = data;
+  }
+}
+
 @Observed
 export class TerminalSession {
   id: number = -1;         // native session id, assigned when shell spawns
@@ -83,6 +111,12 @@ export class TerminalSession {
   /** Bounded raw PTY history used to restore an ArkWeb page after hiding or reload. */
   private outputHistoryChunks: string[] = [];
   private outputHistoryLength: number = 0;
+  private outputHistoryTruncated: boolean = false;
+  /** Absolute cursor of outputHistoryChunks[0]; only moves forward when old output is trimmed. */
+  private outputHistoryStartCursor: number = 0;
+  /** xterm SerializeAddon checkpoint, captured only after the active renderer becomes quiet. */
+  private outputCheckpoint: string = '';
+  private outputCheckpointCursor: number = -1;
   outputVersion: number = 0;
   /** Guards asynchronous ArkWeb page callbacks from spawning duplicate native PTYs. */
   startInProgress: boolean = false;
@@ -92,10 +126,16 @@ export class TerminalSession {
   manualTitle: boolean = false;
   /** TerminalView → Index: called when this session wants attention. */
   onStateChanged: () => void = () => {};
+  /** Persisted metadata changed (title, cwd, etc.); activity-only changes do not use this callback. */
+  onMetadataChanged: () => void = () => {};
   /** TerminalView → native bridge callbacks, wired by TerminalView. */
   onOutput: (data: string) => void = () => {};
+  /** Native TSFN events are owned by the session, never by an evictable ArkWeb view. */
+  onNativeEvent: (event: SessionEvent) => void = () => {};
   /** Called when the shell's working directory changes. */
   onCwdChanged: (cwd: string) => void = () => {};
+  /** Last native process inspection start; keeps background scans adaptive and staggered. */
+  lastProcessInspectionAt: number = 0;
 
   constructor(name: string, sequence: number) {
     this.name = name;
@@ -159,6 +199,7 @@ export class TerminalSession {
     if (this.name !== title) {
       this.name = title;
       this.onStateChanged();
+      this.onMetadataChanged();
     }
   }
 
@@ -221,23 +262,120 @@ export class TerminalSession {
       this.outputHistoryChunks.push(data);
     }
     this.outputHistoryLength += data.length;
+    let historyTrimmed = false;
     while (this.outputHistoryLength > OUTPUT_HISTORY_LIMIT &&
       this.outputHistoryChunks.length > 1) {
       const removed = this.outputHistoryChunks[0];
       this.outputHistoryChunks.splice(0, 1);
       this.outputHistoryLength -= removed.length;
+      this.outputHistoryStartCursor += removed.length;
+      historyTrimmed = true;
     }
     if (this.outputHistoryLength > OUTPUT_HISTORY_LIMIT &&
       this.outputHistoryChunks.length === 1) {
       const only = this.outputHistoryChunks[0];
-      this.outputHistoryChunks[0] = only.substring(only.length - OUTPUT_HISTORY_LIMIT);
+      const removedLength = only.length - OUTPUT_HISTORY_LIMIT;
+      this.outputHistoryChunks[0] = only.substring(removedLength);
       this.outputHistoryLength = this.outputHistoryChunks[0].length;
+      this.outputHistoryStartCursor += removedLength;
+      historyTrimmed = true;
+    }
+    if (historyTrimmed) {
+      this.outputHistoryTruncated = true;
+      // Start a recovery replay at a complete output line instead of in the
+      // middle of a CSI/OSC sequence or a UTF-16 surrogate pair.
+      const first = this.outputHistoryChunks[0];
+      const lineBoundary = first.indexOf('\n');
+      if (lineBoundary >= 0 && lineBoundary < 8192) {
+        const removedLength = lineBoundary + 1;
+        this.outputHistoryChunks[0] = first.substring(removedLength);
+        this.outputHistoryLength -= removedLength;
+        this.outputHistoryStartCursor += removedLength;
+      }
     }
     this.outputVersion++;
   }
 
   outputHistoryText(): string {
-    return this.outputHistoryChunks.join('');
+    const history = this.outputHistoryChunks.join('');
+    if (!this.outputHistoryTruncated) {
+      return history;
+    }
+    // xterm is reset before replay. Reinforce a known primary-buffer/default-
+    // attributes checkpoint so a truncated alternate-screen or color sequence
+    // cannot poison the recovered terminal state.
+    return '\x1Bc\x1B[?1049l\x1B[0m' +
+      '[terminAI] 较早的终端输出已截断，以稳定模式恢复最近内容。\r\n' + history;
+  }
+
+  outputHistoryStart(): number {
+    return this.outputHistoryStartCursor;
+  }
+
+  outputCursor(): number {
+    return this.outputHistoryStartCursor + this.outputHistoryLength;
+  }
+
+  /**
+   * Read only the delta after an absolute renderer cursor. No TerminalView owns
+   * a second growing output queue; all views consume this one bounded ring.
+   */
+  outputAfter(cursor: number, maximumLength: number): TerminalOutputSlice {
+    const historyStart = this.outputHistoryStartCursor;
+    const historyEnd = this.outputCursor();
+    const cursorWasTrimmed = cursor < historyStart;
+    const effectiveCursor = Math.max(cursor, historyStart);
+    if (effectiveCursor >= historyEnd || maximumLength <= 0) {
+      return new TerminalOutputSlice(effectiveCursor, effectiveCursor, '', cursorWasTrimmed);
+    }
+
+    let skip = effectiveCursor - historyStart;
+    let remaining = Math.min(maximumLength, historyEnd - effectiveCursor);
+    const pieces: string[] = [];
+    for (const chunk of this.outputHistoryChunks) {
+      if (skip >= chunk.length) {
+        skip -= chunk.length;
+        continue;
+      }
+      const available = chunk.length - skip;
+      const take = Math.min(available, remaining);
+      pieces.push(chunk.substring(skip, skip + take));
+      remaining -= take;
+      skip = 0;
+      if (remaining <= 0) {
+        break;
+      }
+    }
+    const data = pieces.join('');
+    return new TerminalOutputSlice(effectiveCursor, effectiveCursor + data.length,
+      data, cursorWasTrimmed);
+  }
+
+  outputSnapshot(): TerminalOutputSnapshot {
+    if (this.outputCheckpoint.length > 0 &&
+      this.outputCheckpointCursor >= this.outputHistoryStartCursor &&
+      this.outputCheckpointCursor <= this.outputCursor()) {
+      const remaining = this.outputCursor() - this.outputCheckpointCursor;
+      const delta = this.outputAfter(this.outputCheckpointCursor, remaining);
+      if (!delta.cursorWasTrimmed) {
+        return new TerminalOutputSnapshot(this.outputCheckpointCursor,
+          delta.endCursor, this.outputCheckpoint + delta.data);
+      }
+    }
+    return new TerminalOutputSnapshot(this.outputHistoryStartCursor,
+      this.outputCursor(), this.outputHistoryText());
+  }
+
+  recordOutputCheckpoint(cursor: number, data: string): void {
+    // MessagePort traffic and session memory remain bounded even when the user
+    // configures an extremely large xterm scrollback value.
+    if (data.length === 0 || data.length > 1024 * 1024 ||
+      cursor < this.outputHistoryStartCursor || cursor > this.outputCursor() ||
+      cursor < this.outputCheckpointCursor) {
+      return;
+    }
+    this.outputCheckpointCursor = cursor;
+    this.outputCheckpoint = data;
   }
 
   private setActivityState(next: AgentRunState): void {
@@ -562,7 +700,10 @@ export class SessionManager {
     s.disposed = true;
     s.startInProgress = false;
     if (s.id > 0) {
-      try { libterminal.killSession(s.id); } catch (e) {}
+      libterminal.killSessionAsync(s.id)
+        .catch((error: Error) => {
+          console.error('TERMINAI async session cleanup failed: ' + error.message);
+        });
     }
     const idx = this.sessions.indexOf(s);
     if (idx >= 0) this.sessions.splice(idx, 1);
@@ -573,7 +714,10 @@ export class SessionManager {
       s.disposed = true;
       s.startInProgress = false;
       if (s.id > 0) {
-        try { libterminal.killSession(s.id); } catch (e) {}
+        libterminal.killSessionAsync(s.id)
+          .catch((error: Error) => {
+            console.error('TERMINAI async session cleanup failed: ' + error.message);
+          });
       }
     }
     this.sessions = [];

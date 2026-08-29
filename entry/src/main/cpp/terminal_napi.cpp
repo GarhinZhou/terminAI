@@ -7,6 +7,7 @@
 // Output is streamed to ArkTS through a per-session threadsafe function.
 
 #include <cerrno>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -19,6 +20,8 @@
 #include <signal.h>
 #include <pthread.h>
 #include <cctype>
+#include <chrono>
+#include <deque>
 #include <sstream>
 #include <string>
 #include <sys/ioctl.h>
@@ -41,7 +44,10 @@
 namespace {
 
 constexpr int kReadChunk = 64 * 1024;
+constexpr size_t kReadBurstLimit = 512 * 1024;
 constexpr size_t kTsfnQueueLimit = 64;
+constexpr size_t kPendingWriteLimit = 4 * 1024 * 1024;
+constexpr int kCwdPollIntervalMs = 300;
 constexpr const char* kFallbackHome = "/storage/Users/currentUser";
 
 std::string UserHomeDirectory() {
@@ -84,6 +90,11 @@ struct SessionEvent {
     int exitCode = -1;    // exit status (kind == exit)
 };
 
+struct PendingWrite {
+    std::string data;
+    size_t offset = 0;
+};
+
 struct PtySession {
     int id = -1;
     int masterFd = -1;
@@ -96,7 +107,14 @@ struct PtySession {
     pthread_t waiterThread{};
     bool readerStarted = false;
     bool waiterStarted = false;
-    bool closing = false;
+    std::atomic<bool> closing { false };
+    bool childReaped = false;
+    bool trackLocalCwd = true;
+    int wakeReadFd = -1;
+    int wakeWriteFd = -1;
+    std::mutex writeMutex;
+    std::deque<PendingWrite> pendingWrites;
+    size_t pendingWriteBytes = 0;
     std::string cwd;   // last known working directory
     std::string startCwd;
     // Used only by the hidden SSH master session. It is never placed in a
@@ -254,7 +272,87 @@ std::string SanitizeUtf8Chunk(const char* bytes, size_t length,
     return output;
 }
 
-void HandleStoredSshPassword(PtySession* s, int masterFd, const std::string& output) {
+void WakeReader(PtySession* s) {
+    if (s->wakeWriteFd < 0) return;
+    const char value = 'w';
+    ssize_t result = write(s->wakeWriteFd, &value, 1);
+    (void)result;
+}
+
+bool EnqueueSessionWrite(PtySession* s, std::string data, bool highPriority) {
+    if (data.empty()) return true;
+    {
+        std::lock_guard<std::mutex> lk(s->writeMutex);
+        if (s->closing || data.size() > kPendingWriteLimit -
+            std::min(kPendingWriteLimit, s->pendingWriteBytes)) {
+            SecureErase(data);
+            return false;
+        }
+        PendingWrite item;
+        item.data.swap(data);
+        s->pendingWriteBytes += item.data.size();
+        if (highPriority) s->pendingWrites.push_front(std::move(item));
+        else s->pendingWrites.push_back(std::move(item));
+    }
+    WakeReader(s);
+    return true;
+}
+
+bool HasPendingWrites(PtySession* s) {
+    std::lock_guard<std::mutex> lk(s->writeMutex);
+    return !s->pendingWrites.empty();
+}
+
+void DrainWakePipe(PtySession* s) {
+    if (s->wakeReadFd < 0) return;
+    char buffer[64];
+    for (;;) {
+        ssize_t count = read(s->wakeReadFd, buffer, sizeof(buffer));
+        if (count > 0) continue;
+        if (count < 0 && errno == EINTR) continue;
+        break;
+    }
+}
+
+void DrainPendingWrites(PtySession* s, int masterFd) {
+    std::lock_guard<std::mutex> lk(s->writeMutex);
+    while (!s->pendingWrites.empty()) {
+        PendingWrite& item = s->pendingWrites.front();
+        const char* cursor = item.data.data() + item.offset;
+        const size_t remaining = item.data.size() - item.offset;
+        ssize_t count = write(masterFd, cursor, remaining);
+        if (count > 0) {
+            item.offset += static_cast<size_t>(count);
+            s->pendingWriteBytes -= static_cast<size_t>(count);
+            if (item.offset >= item.data.size()) {
+                SecureErase(item.data);
+                s->pendingWrites.pop_front();
+            }
+            continue;
+        }
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+        // The PTY is no longer writable. Drop queued input; the reader/waiter
+        // path will deliver the authoritative exit event.
+        for (PendingWrite& pending : s->pendingWrites) {
+            SecureErase(pending.data);
+        }
+        s->pendingWrites.clear();
+        s->pendingWriteBytes = 0;
+        return;
+    }
+}
+
+void ClearPendingWrites(PtySession* s) {
+    std::lock_guard<std::mutex> lk(s->writeMutex);
+    for (PendingWrite& pending : s->pendingWrites) {
+        SecureErase(pending.data);
+    }
+    s->pendingWrites.clear();
+    s->pendingWriteBytes = 0;
+}
+
+void HandleStoredSshPassword(PtySession* s, const std::string& output) {
     if (s->authSecret.empty()) return;
     s->authTail += output;
     if (s->authTail.size() > 1024) {
@@ -269,33 +367,9 @@ void HandleStoredSshPassword(PtySession* s, int masterFd, const std::string& out
     if (s->authSecretSent || lower.find("password:") == std::string::npos) return;
 
     std::string input = s->authSecret + "\n";
-    const char* cursor = input.data();
-    size_t left = input.size();
-    bool written = true;
-    while (left > 0) {
-        ssize_t count = write(masterFd, cursor, left);
-        if (count > 0) {
-            cursor += count;
-            left -= static_cast<size_t>(count);
-            continue;
-        }
-        if (count < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                struct pollfd pfd { masterFd, POLLOUT, 0 };
-                int result = poll(&pfd, 1, 100);
-                if (result > 0) continue;
-                if (result < 0 && errno == EINTR) continue;
-            }
-            written = false;
-            break;
-        }
-        written = false;
-        break;
-    }
+    const bool written = EnqueueSessionWrite(s, std::move(input), true);
     s->authSecretSent = true;
     SecureErase(s->authSecret);
-    SecureErase(input);
     s->authTail.clear();
     LOGI("session %{public}d handled stored SSH password written=%{public}d", s->id, written ? 1 : 0);
 }
@@ -307,9 +381,14 @@ void* ReaderMain(void* arg) {
     const int masterFd = s->masterFd;
     char buf[kReadChunk];
     std::string utf8Tail;
+    auto nextCwdPoll = std::chrono::steady_clock::now();
     for (;;) {
-        struct pollfd pfd { masterFd, POLLIN, 0 };
-        int pr = poll(&pfd, 1, 500);
+        const bool wantsWrite = HasPendingWrites(s);
+        struct pollfd pfds[2] = {
+            { masterFd, static_cast<short>(POLLIN | (wantsWrite ? POLLOUT : 0)), 0 },
+            { s->wakeReadFd, POLLIN, 0 }
+        };
+        int pr = poll(pfds, s->wakeReadFd >= 0 ? 2 : 1, 500);
         if (pr < 0) {
             if (errno == EINTR) continue;
             LOGE("session %d poll error errno=%d", s->id, errno);
@@ -321,21 +400,35 @@ void* ReaderMain(void* arg) {
             if (!s->alive) return nullptr;
             continue;
         }
+        if (s->wakeReadFd >= 0 && (pfds[1].revents & POLLIN)) {
+            DrainWakePipe(s);
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_mutex);
+            if (s->closing) break;
+        }
+        if ((pfds[0].revents & POLLOUT) || HasPendingWrites(s)) {
+            DrainPendingWrites(s, masterFd);
+        }
+
         bool reachedEnd = false;
-        if (pfd.revents & (POLLIN | POLLERR | POLLHUP)) {
+        if (pfds[0].revents & (POLLIN | POLLERR | POLLHUP)) {
             // Drain every byte before reporting exit. POLLIN and POLLHUP are
             // commonly delivered together; reading only once loses the final
             // screen when a short-lived shell or SSH process terminates.
+            size_t burstBytes = 0;
             for (;;) {
                 ssize_t n = read(masterFd, buf, sizeof(buf));
                 if (n > 0) {
+                    burstBytes += static_cast<size_t>(n);
                     const std::string rawOutput(buf, n);
-                    HandleStoredSshPassword(s, masterFd, rawOutput);
+                    HandleStoredSshPassword(s, rawOutput);
                     const std::string output = SanitizeUtf8Chunk(
                         buf, static_cast<size_t>(n), utf8Tail, false);
                     if (!output.empty()) {
                         PushEvent(s, kKindOutput, output, -1);
                     }
+                    if (burstBytes >= kReadBurstLimit) break;
                     continue;
                 }
                 if (n == 0) {
@@ -351,18 +444,16 @@ void* ReaderMain(void* arg) {
             // Track cwd changes (shell cd) after the output burst. Doing this
             // once per poll wakeup avoids holding the global session mutex for
             // every individual PTY read.
-            if (!reachedEnd && !(pfd.revents & (POLLERR | POLLHUP))) {
+            const auto now = std::chrono::steady_clock::now();
+            if (s->trackLocalCwd && now >= nextCwdPoll && !reachedEnd &&
+                !(pfds[0].revents & (POLLERR | POLLHUP))) {
+                nextCwdPoll = now + std::chrono::milliseconds(kCwdPollIntervalMs);
                 char linkBuf[1024] = {};
                 char procPath[64];
                 snprintf(procPath, sizeof(procPath), "/proc/%d/cwd", s->childPid);
                 ssize_t len = readlink(procPath, linkBuf, sizeof(linkBuf) - 1);
                 if (len > 0) {
                     linkBuf[len] = '\0';
-                    static bool loggedOnce = false;
-                    if (!loggedOnce) {
-                        loggedOnce = true;
-                        LOGI("cwd read OK: %{public}s", linkBuf);
-                    }
                     bool cwdChanged = false;
                     {
                         std::lock_guard<std::mutex> lk(g_mutex);
@@ -377,15 +468,15 @@ void* ReaderMain(void* arg) {
                 }
             }
         }
-        if (reachedEnd || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+        if (reachedEnd || (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL))) {
             break;
         }
-        if (pfd.revents & POLLIN) {
+        if (pfds[0].revents & POLLIN) {
             // The nonblocking drain above consumed all currently available
             // data. Keep polling for the next output burst.
             continue;
         }
-        if (pfd.revents & POLLNVAL) {
+        if (pfds[0].revents & POLLNVAL) {
             break;
         }
     }
@@ -399,14 +490,26 @@ void* ReaderMain(void* arg) {
 
 void* WaiterMain(void* arg) {
     PtySession* s = static_cast<PtySession*>(arg);
+    const pid_t childPid = s->childPid;
     int status = 0;
-    pid_t w = waitpid(s->childPid, &status, 0);
+    pid_t w = -1;
+    do {
+        w = waitpid(childPid, &status, 0);
+    } while (w < 0 && errno == EINTR);
+    const bool childConsumed = w == childPid || (w < 0 && errno == ECHILD);
     int code = -1;
-    if (w == s->childPid) {
+    if (w == childPid) {
         if (WIFEXITED(status)) code = WEXITSTATUS(status);
         else if (WIFSIGNALED(status)) code = 128 + WTERMSIG(status);
     }
-    LOGI("session %{public}d child %{public}d exited code=%{public}d", s->id, s->childPid, code);
+    // waitpid() has already consumed the child. Publish that fact before the
+    // potentially long reader drain/join so a concurrent close cannot signal
+    // an unrelated process if the kernel reuses the PID in the meantime.
+    {
+        std::lock_guard<std::mutex> lk(g_mutex);
+        s->childReaped = childConsumed;
+    }
+    LOGI("session %{public}d child %{public}d exited code=%{public}d", s->id, childPid, code);
     // ReaderMain owns the ordering of PTY output. Wait until it has drained the
     // slave side completely, then enqueue exit after every output event.
     if (s->readerStarted) {
@@ -426,15 +529,22 @@ void* WaiterMain(void* arg) {
 
 // ── Session lifecycle ───────────────────────────────────────────────
 
-void DestroySession(PtySession* s) {
+bool SessionChildNeedsSignal(PtySession* s, pid_t childPid) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    return childPid > 0 && s->childPid == childPid && !s->childReaped;
+}
+
+void DestroySessionProcess(PtySession* s) {
     // The session has already been removed and marked dead under g_mutex.
     // Never join while holding that mutex: reader/waiter callbacks may need it.
-    if (s->childPid > 0) {
-        kill(-s->childPid, SIGHUP);
-        kill(s->childPid, SIGHUP);
-        kill(-s->childPid, SIGTERM);
-        kill(s->childPid, SIGTERM);
+    const pid_t childPid = s->childPid;
+    if (SessionChildNeedsSignal(s, childPid)) {
+        kill(-childPid, SIGHUP);
+        kill(childPid, SIGHUP);
+        kill(-childPid, SIGTERM);
+        kill(childPid, SIGTERM);
     }
+    WakeReader(s);
     if (s->masterFd >= 0) {
         close(s->masterFd);
         s->masterFd = -1;
@@ -442,14 +552,15 @@ void DestroySession(PtySession* s) {
 
     // A shell or one of its descendants can ignore SIGHUP/SIGTERM. Bound the
     // close path so killSession can never freeze the ArkUI thread forever.
-    if (s->childPid > 0) {
+    if (SessionChildNeedsSignal(s, childPid)) {
         for (int attempt = 0; attempt < 10; ++attempt) {
-            if (kill(s->childPid, 0) != 0 && errno == ESRCH) break;
+            if (!SessionChildNeedsSignal(s, childPid) ||
+                (kill(childPid, 0) != 0 && errno == ESRCH)) break;
             usleep(10 * 1000);
         }
-        if (kill(s->childPid, 0) == 0) {
-            kill(-s->childPid, SIGKILL);
-            kill(s->childPid, SIGKILL);
+        if (SessionChildNeedsSignal(s, childPid) && kill(childPid, 0) == 0) {
+            kill(-childPid, SIGKILL);
+            kill(childPid, SIGKILL);
         }
     }
     if (s->waiterStarted) {
@@ -459,6 +570,18 @@ void DestroySession(PtySession* s) {
         pthread_join(s->readerThread, nullptr);
         s->readerStarted = false;
     }
+    if (s->wakeReadFd >= 0) {
+        close(s->wakeReadFd);
+        s->wakeReadFd = -1;
+    }
+    if (s->wakeWriteFd >= 0) {
+        close(s->wakeWriteFd);
+        s->wakeWriteFd = -1;
+    }
+    ClearPendingWrites(s);
+}
+
+void ReleaseSessionNapi(PtySession* s) {
     if (s->tsfn != nullptr) {
         napi_release_threadsafe_function(s->tsfn, napi_tsfn_abort);
         s->tsfn = nullptr;
@@ -468,6 +591,11 @@ void DestroySession(PtySession* s) {
         s->jsCallbackRef = nullptr;
     }
     delete s;
+}
+
+void DestroySession(PtySession* s) {
+    DestroySessionProcess(s);
+    ReleaseSessionNapi(s);
 }
 
 bool ReadUtf8String(napi_env env, napi_value value, size_t maximumLength, std::string& output) {
@@ -595,6 +723,26 @@ napi_value CreateSession(napi_env env, napi_callback_info info) {
         return nullptr;
     }
 
+    int wakePipe[2] = { -1, -1 };
+    if (pipe(wakePipe) != 0) {
+        const int setupError = errno;
+        LOGE("session create: wake pipe failed errno=%{public}d", setupError);
+        close(master);
+        napi_release_threadsafe_function(s->tsfn, napi_tsfn_abort);
+        napi_delete_reference(env, s->jsCallbackRef);
+        delete s;
+        napi_throw_error(env, nullptr, "configure terminal input queue failed");
+        return nullptr;
+    }
+    for (int fd : wakePipe) {
+        const int flags = fcntl(fd, F_GETFL, 0);
+        const int descriptorFlags = fcntl(fd, F_GETFD, 0);
+        if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        if (descriptorFlags >= 0) fcntl(fd, F_SETFD, descriptorFlags | FD_CLOEXEC);
+    }
+    s->wakeReadFd = wakePipe[0];
+    s->wakeWriteFd = wakePipe[1];
+
     struct winsize ws { (unsigned short)rows, (unsigned short)cols, 0, 0 };
     ioctl(master, TIOCSWINSZ, &ws);
 
@@ -602,6 +750,10 @@ napi_value CreateSession(napi_env env, napi_callback_info info) {
     if (child < 0) {
         LOGE("fork failed errno=%d", errno);
         close(master);
+        close(s->wakeReadFd);
+        close(s->wakeWriteFd);
+        s->wakeReadFd = -1;
+        s->wakeWriteFd = -1;
         napi_throw_error(env, nullptr, "fork failed");
         napi_release_threadsafe_function(s->tsfn, napi_tsfn_abort);
         napi_delete_reference(env, s->jsCallbackRef);
@@ -610,6 +762,8 @@ napi_value CreateSession(napi_env env, napi_callback_info info) {
     }
     if (child == 0) {
         // ── child: attach slave as controlling terminal ──
+        close(wakePipe[0]);
+        close(wakePipe[1]);
         setsid();
         int slave = open(slavePath, O_RDWR);
         if (slave < 0) _exit(1);
@@ -667,6 +821,7 @@ napi_value CreateSession(napi_env env, napi_callback_info info) {
     s->alive = true;
     s->cwd = startCwd;
     s->startCwd = startCwd;
+    s->trackLocalCwd = startCmd.rfind("/usr/bin/ssh", 0) != 0;
     {
         std::lock_guard<std::mutex> lk(g_mutex);
         g_sessions[s->id] = s;
@@ -690,9 +845,14 @@ napi_value CreateSession(napi_env env, napi_callback_info info) {
         kill(child, SIGKILL);
         close(master);
         s->masterFd = -1;
+        WakeReader(s);
         if (s->readerStarted) {
             pthread_join(s->readerThread, nullptr);
         }
+        if (s->wakeReadFd >= 0) close(s->wakeReadFd);
+        if (s->wakeWriteFd >= 0) close(s->wakeWriteFd);
+        s->wakeReadFd = -1;
+        s->wakeWriteFd = -1;
         int childStatus = 0;
         waitpid(child, &childStatus, 0);
         napi_release_threadsafe_function(s->tsfn, napi_tsfn_abort);
@@ -718,46 +878,18 @@ napi_value WriteSession(napi_env env, napi_callback_info info) {
     int32_t id;
     napi_get_value_int32(env, args[0], &id);
     std::string data;
-    ReadUtf8String(env, args[1], 1024 * 1024, data);
-    int writeFd = -1;
+    const bool validData = ReadUtf8String(env, args[1], kPendingWriteLimit, data);
+    bool ok = false;
     {
         std::lock_guard<std::mutex> lk(g_mutex);
         auto it = g_sessions.find(id);
-        if (it != g_sessions.end() && it->second->alive && it->second->masterFd >= 0) {
-            writeFd = dup(it->second->masterFd);
+        if (validData && it != g_sessions.end() && it->second->alive &&
+            it->second->masterFd >= 0) {
+            // Keep the registry lock until the write has been copied into the
+            // session-owned queue. Async close removes the entry before it can
+            // destroy the session, so the raw pointer cannot become stale.
+            ok = EnqueueSessionWrite(it->second, std::move(data), false);
         }
-    }
-    bool ok = writeFd >= 0;
-    if (ok) {
-        const char* p = data.data();
-        size_t left = data.size();
-        int waitCount = 0;
-        while (ok && left > 0) {
-            ssize_t n = write(writeFd, p, left);
-            if (n > 0) {
-                p += n;
-                left -= static_cast<size_t>(n);
-                waitCount = 0;
-                continue;
-            }
-            if (n == 0) {
-                ok = false;
-                break;
-            }
-            if (n < 0) {
-                if (errno == EINTR) continue;
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    struct pollfd pfd { writeFd, POLLOUT, 0 };
-                    int result = poll(&pfd, 1, 25);
-                    if (result > 0) continue;
-                    if (result < 0 && errno == EINTR) continue;
-                    if (result == 0 && ++waitCount < 8) continue;
-                }
-                ok = false;
-                break;
-            }
-        }
-        close(writeFd);
     }
     napi_value ret;
     napi_get_boolean(env, ok, &ret);
@@ -814,6 +946,95 @@ napi_value KillSession(napi_env env, napi_callback_info info) {
     napi_value ret;
     napi_get_boolean(env, victim != nullptr, &ret);
     return ret;
+}
+
+struct KillSessionAsyncWork {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    PtySession* session = nullptr;
+    bool previousAlive = false;
+    bool previousClosing = false;
+};
+
+void ExecuteKillSession(napi_env /*env*/, void* data) {
+    KillSessionAsyncWork* request = static_cast<KillSessionAsyncWork*>(data);
+    DestroySessionProcess(request->session);
+}
+
+void CompleteKillSession(napi_env env, napi_status status, void* data) {
+    KillSessionAsyncWork* request = static_cast<KillSessionAsyncWork*>(data);
+    ReleaseSessionNapi(request->session);
+    if (status == napi_ok) {
+        napi_value result;
+        napi_get_boolean(env, true, &result);
+        napi_resolve_deferred(env, request->deferred, result);
+    } else {
+        napi_value message;
+        napi_create_string_utf8(env, "terminal cleanup worker failed", NAPI_AUTO_LENGTH, &message);
+        napi_value error;
+        napi_create_error(env, nullptr, message, &error);
+        napi_reject_deferred(env, request->deferred, error);
+    }
+    napi_delete_async_work(env, request->work);
+    delete request;
+}
+
+// ── NAPI: killSessionAsync(id) -> Promise<boolean> ──────────────────
+
+napi_value KillSessionAsync(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    int32_t id = -1;
+    napi_get_value_int32(env, args[0], &id);
+
+    KillSessionAsyncWork* request = new KillSessionAsyncWork();
+    napi_value promise;
+    napi_create_promise(env, &request->deferred, &promise);
+    {
+        std::lock_guard<std::mutex> lk(g_mutex);
+        auto it = g_sessions.find(id);
+        if (it != g_sessions.end()) {
+            request->session = it->second;
+            request->previousAlive = request->session->alive;
+            request->previousClosing = request->session->closing;
+            request->session->closing = true;
+            request->session->alive = false;
+            g_sessions.erase(it);
+        }
+    }
+    if (request->session == nullptr) {
+        napi_value result;
+        napi_get_boolean(env, false, &result);
+        napi_resolve_deferred(env, request->deferred, result);
+        delete request;
+        return promise;
+    }
+
+    napi_value resourceName;
+    napi_create_string_utf8(env, "terminai_kill_session", NAPI_AUTO_LENGTH, &resourceName);
+    napi_status status = napi_create_async_work(env, nullptr, resourceName, ExecuteKillSession,
+        CompleteKillSession, request, &request->work);
+    if (status != napi_ok || napi_queue_async_work(env, request->work) != napi_ok) {
+        // Restore a usable session entry if the worker could not be queued. The
+        // caller can retry without paying a synchronous UI-thread join here.
+        {
+            std::lock_guard<std::mutex> lk(g_mutex);
+            request->session->closing = request->previousClosing;
+            request->session->alive = request->previousAlive;
+            g_sessions[id] = request->session;
+        }
+        napi_value message;
+        napi_create_string_utf8(env, "unable to queue terminal cleanup", NAPI_AUTO_LENGTH, &message);
+        napi_value error;
+        napi_create_error(env, nullptr, message, &error);
+        napi_reject_deferred(env, request->deferred, error);
+        if (request->work != nullptr) {
+            napi_delete_async_work(env, request->work);
+        }
+        delete request;
+    }
+    return promise;
 }
 
 // ── NAPI: listSessions() → [{id, pid, alive}] ──────────────────────
@@ -961,29 +1182,26 @@ pid_t RepresentativeProcess(pid_t foregroundGroup, pid_t fallback) {
     return !leaderCommand.empty() ? foregroundGroup : fallback;
 }
 
-// ── NAPI: inspectSession(id) -> foreground process signal ──────────
-napi_value InspectSession(napi_env env, napi_callback_info info) {
-    size_t argc = 1;
-    napi_value args[1] = {};
-    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
-    int32_t id = -1;
-    napi_get_value_int32(env, args[0], &id);
-
+struct SessionProcessSnapshot {
     bool alive = false;
     pid_t shellPid = -1;
     pid_t foregroundPid = -1;
-    int inspectFd = -1;
     std::string command;
     std::string processState;
     unsigned long long cpuTicks = 0;
+};
+
+SessionProcessSnapshot CollectSessionProcessSnapshot(int32_t id) {
+    SessionProcessSnapshot snapshot;
+    int inspectFd = -1;
     {
         std::lock_guard<std::mutex> lk(g_mutex);
         auto it = g_sessions.find(id);
         if (it != g_sessions.end()) {
             PtySession* session = it->second;
-            alive = session->alive;
-            shellPid = session->childPid;
-            if (alive && session->masterFd >= 0) {
+            snapshot.alive = session->alive;
+            snapshot.shellPid = session->childPid;
+            if (snapshot.alive && session->masterFd >= 0) {
                 inspectFd = dup(session->masterFd);
             }
         }
@@ -991,33 +1209,101 @@ napi_value InspectSession(napi_env env, napi_callback_info info) {
     if (inspectFd >= 0) {
         const pid_t group = tcgetpgrp(inspectFd);
         close(inspectFd);
-        foregroundPid = RepresentativeProcess(group, shellPid);
-        command = ProcessCommand(foregroundPid);
+        snapshot.foregroundPid = RepresentativeProcess(group, snapshot.shellPid);
+        snapshot.command = ProcessCommand(snapshot.foregroundPid);
         ProcessRuntimeStats stats;
-        if (ReadProcessRuntimeStats(foregroundPid, stats)) {
-            processState.assign(1, stats.state);
-            cpuTicks = stats.cpuTicks;
+        if (ReadProcessRuntimeStats(snapshot.foregroundPid, stats)) {
+            snapshot.processState.assign(1, stats.state);
+            snapshot.cpuTicks = stats.cpuTicks;
         }
     }
+    return snapshot;
+}
 
+napi_value SessionProcessSnapshotObject(napi_env env, const SessionProcessSnapshot& snapshot) {
     napi_value object;
     napi_create_object(env, &object);
     napi_value value;
-    napi_get_boolean(env, alive, &value);
+    napi_get_boolean(env, snapshot.alive, &value);
     napi_set_named_property(env, object, "alive", value);
-    napi_create_int32(env, shellPid, &value);
+    napi_create_int32(env, snapshot.shellPid, &value);
     napi_set_named_property(env, object, "shellPid", value);
-    napi_create_int32(env, foregroundPid, &value);
+    napi_create_int32(env, snapshot.foregroundPid, &value);
     napi_set_named_property(env, object, "foregroundPid", value);
-    napi_create_string_utf8(env, command.c_str(), NAPI_AUTO_LENGTH, &value);
+    napi_create_string_utf8(env, snapshot.command.c_str(), NAPI_AUTO_LENGTH, &value);
     napi_set_named_property(env, object, "foregroundCommand", value);
-    napi_get_boolean(env, IsShellCommand(command), &value);
+    napi_get_boolean(env, IsShellCommand(snapshot.command), &value);
     napi_set_named_property(env, object, "foregroundIsShell", value);
-    napi_create_string_utf8(env, processState.c_str(), NAPI_AUTO_LENGTH, &value);
+    napi_create_string_utf8(env, snapshot.processState.c_str(), NAPI_AUTO_LENGTH, &value);
     napi_set_named_property(env, object, "foregroundState", value);
-    napi_create_int64(env, static_cast<int64_t>(cpuTicks), &value);
+    napi_create_int64(env, static_cast<int64_t>(snapshot.cpuTicks), &value);
     napi_set_named_property(env, object, "cpuTimeTicks", value);
     return object;
+}
+
+// ── NAPI: inspectSession(id) -> foreground process signal ──────────
+napi_value InspectSession(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    int32_t id = -1;
+    napi_get_value_int32(env, args[0], &id);
+    return SessionProcessSnapshotObject(env, CollectSessionProcessSnapshot(id));
+}
+
+struct InspectSessionAsyncWork {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    int32_t id = -1;
+    SessionProcessSnapshot snapshot;
+};
+
+void ExecuteInspectSession(napi_env /*env*/, void* data) {
+    InspectSessionAsyncWork* request = static_cast<InspectSessionAsyncWork*>(data);
+    request->snapshot = CollectSessionProcessSnapshot(request->id);
+}
+
+void CompleteInspectSession(napi_env env, napi_status status, void* data) {
+    InspectSessionAsyncWork* request = static_cast<InspectSessionAsyncWork*>(data);
+    if (status == napi_ok) {
+        napi_value result = SessionProcessSnapshotObject(env, request->snapshot);
+        napi_resolve_deferred(env, request->deferred, result);
+    } else {
+        napi_value message;
+        napi_create_string_utf8(env, "inspect session async work failed", NAPI_AUTO_LENGTH, &message);
+        napi_value error;
+        napi_create_error(env, nullptr, message, &error);
+        napi_reject_deferred(env, request->deferred, error);
+    }
+    napi_delete_async_work(env, request->work);
+    delete request;
+}
+
+napi_value InspectSessionAsync(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    InspectSessionAsyncWork* request = new InspectSessionAsyncWork();
+    napi_get_value_int32(env, args[0], &request->id);
+
+    napi_value promise;
+    napi_create_promise(env, &request->deferred, &promise);
+    napi_value resourceName;
+    napi_create_string_utf8(env, "terminai_inspect_session", NAPI_AUTO_LENGTH, &resourceName);
+    napi_status status = napi_create_async_work(env, nullptr, resourceName, ExecuteInspectSession,
+        CompleteInspectSession, request, &request->work);
+    if (status != napi_ok || napi_queue_async_work(env, request->work) != napi_ok) {
+        napi_value message;
+        napi_create_string_utf8(env, "unable to queue session inspection", NAPI_AUTO_LENGTH, &message);
+        napi_value error;
+        napi_create_error(env, nullptr, message, &error);
+        napi_reject_deferred(env, request->deferred, error);
+        if (request->work != nullptr) {
+            napi_delete_async_work(env, request->work);
+        }
+        delete request;
+    }
+    return promise;
 }
 
 // ── NAPI: listPrograms() -> [{name, path}] ──────────────────────────
@@ -1114,8 +1400,10 @@ napi_value Init(napi_env env, napi_value exports) {
         { "writeSession", nullptr, WriteSession, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "resizeSession", nullptr, ResizeSession, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "killSession", nullptr, KillSession, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "killSessionAsync", nullptr, KillSessionAsync, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "listSessions", nullptr, ListSessions, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "inspectSession", nullptr, InspectSession, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "inspectSessionAsync", nullptr, InspectSessionAsync, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "listPrograms", nullptr, ListPrograms, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "listDirs", nullptr, ListDirs, nullptr, nullptr, nullptr, napi_default, nullptr },
     };

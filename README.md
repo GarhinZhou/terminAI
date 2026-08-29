@@ -114,6 +114,14 @@ devecocli run --device <设备序列号>
 
 也可以在 DevEco Studio 中导入工程、配置签名后构建和运行。请勿将 `.p12`、私钥密码、调试 Profile 或设备标识提交到仓库。
 
+终端前端协议与内置 xterm 资源兼容性测试：
+
+```bash
+node tests/terminal_protocol_test.mjs
+```
+
+该测试覆盖实时输出确认、历史回放、渲染器心跳和序列化恢复检查点；当前内置版本为 `@xterm/xterm 5.5.0` 与 `@xterm/addon-serialize 0.13.0`。
+
 ## 权限说明
 
 当前模块声明了以下权限：

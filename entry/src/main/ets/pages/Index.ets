@@ -80,6 +80,12 @@ const PREF_REMOTE_SHELLS = 'remoteShells';        // JSON {deviceId: loginShell}
 const PREF_LAST_PROGRAMS = 'lastProgramsByDevice';
 const PREF_SAVED_SESSIONS = 'savedSessions';
 const PREF_CURRENT_SESSION = 'currentSessionIndex';
+const ACTIVITY_TICK_INTERVAL = 250;
+const ACTIVE_PROCESS_INSPECTION_INTERVAL = 750;
+const BACKGROUND_PROCESS_INSPECTION_INTERVAL = 2500;
+const PROCESS_INSPECTION_TIMEOUT = 3500;
+const RENDERER_POOL_LIMIT = 3;
+const STYLE_SAVE_DELAY = 350;
 
 @Entry
 @Component
@@ -88,6 +94,8 @@ struct Index {
   @State @Watch('onCurrentSessionChanged') currentIdx: number = -1;
   @State sidebarCollapsed: boolean = false;
   @State sidebarWidth: number = 280;
+  /** Current plus two recent ArkWeb renderers; PTY sessions continue independently when evicted. */
+  @State private renderedSessionUids: number[] = [];
   @State defaultCwd: string = DEFAULT_CWD;
   @State private titleSidebarHovered: boolean = false;
   @State private titleSidebarPressed: boolean = false;
@@ -126,11 +134,16 @@ struct Index {
   private titleTouchDown: boolean = false;
   private titleMoving: boolean = false;
   private activityTimer: number = -1;
+  private activityInspectionInFlight: boolean = false;
+  private activityInspectionGeneration: number = 0;
+  private activityInspectionTimer: number = -1;
+  private activityScanCursor: number = 0;
   private mgr: SessionManager = new SessionManager();
   private sshConnections: SshRuntimeConnection[] = [];
   private mainWindow: window.Window | undefined = AppStorage.get<window.Window>('mainWindow');
   // Standard modal dialogs.
   private sessionSaveTimer: number = -1;
+  private styleSaveTimer: number = -1;
   private restoringSessions: boolean = false;
   private savedSessionsEncoded: string = '';
   private savedCurrentSessionIndex: number = -1;
@@ -181,7 +194,12 @@ struct Index {
   private paletteCtrl: CustomDialogController = new CustomDialogController({
     builder: SearchView({
       getSessions: () => this.sessions,
-      onPick: (idx: number) => { this.currentIdx = idx; },
+      onPick: (uid: number) => {
+        const index = this.sessions.findIndex((session: TerminalSession) => session.uid === uid);
+        if (index >= 0) {
+          this.currentIdx = index;
+        }
+      },
       onPickSpace: (cwd: string, deviceId: string) => {
         this.selectDevice(deviceId);
         AppStorage.setOrCreate('selectedSpace', deviceId + '\t' + cwd);
@@ -217,22 +235,35 @@ struct Index {
     setTimeout(() => { this.settingsCtrl.open(); }, 80);
   }
 
-  private terminalFocusId(session: TerminalSession): string {
-    return 'terminal_web_' + session.uid.toString();
-  }
-
   onCurrentSessionChanged(): void {
     this.saveSessionsSoon();
     const session = this.currentIdx >= 0 && this.currentIdx < this.sessions.length ?
       this.sessions[this.currentIdx] : null;
     if (session === null) return;
-    setTimeout(() => {
-      try {
-        this.getUIContext().getFocusController().requestFocus(this.terminalFocusId(session));
-      } catch (error) {
-        console.error('TERMINAI focus selected session failed: ' + JSON.stringify(error));
+    this.touchRenderedSession(session.uid);
+    // TerminalView requests focus after its ArkWeb is mounted, visible and
+    // ready. Requesting it here races the renderer-pool update and can target
+    // a component that is still hidden or does not exist yet.
+  }
+
+  private touchRenderedSession(uid: number): void {
+    const next: number[] = [uid];
+    for (const existing of this.renderedSessionUids) {
+      if (existing !== uid && this.sessions.some((session: TerminalSession) => session.uid === existing)) {
+        next.push(existing);
       }
-    }, 0);
+      if (next.length >= RENDERER_POOL_LIMIT) {
+        break;
+      }
+    }
+    this.renderedSessionUids = next;
+  }
+
+  private renderedSessions(): TerminalSession[] {
+    const current = this.currentSession();
+    return this.sessions.filter((session: TerminalSession) =>
+      session.uid === (current === null ? -1 : current.uid) ||
+      this.renderedSessionUids.some((uid: number) => uid === session.uid));
   }
 
   private savedSessionInfo(session: TerminalSession): SavedSessionInfo {
@@ -312,13 +343,13 @@ struct Index {
           this.sessions = [...this.sessions];
         }
         if (ev.kind === 'exit' && s.id > 0) {
-          // Reap native resources. Deferred: the exit event is delivered from
-          // the native waiter thread via TSFN; joining that thread from within
-          // its own callback would deadlock, so clean up on a later tick.
+          // Remove the native id immediately; process/thread cleanup runs in a
+          // native async worker and never joins from the ArkUI callback thread.
           const deadId = s.id;
-          setTimeout(() => {
-            try { libterminal.killSession(deadId); } catch (e) {}
-          }, 200);
+          libterminal.killSessionAsync(deadId)
+            .catch((error: Error) => {
+              console.error('TERMINAI async exited-session cleanup failed: ' + error.message);
+            });
           s.id = -1;
         }
       }
@@ -333,7 +364,7 @@ struct Index {
     }
     this.activityTimer = setInterval(() => {
       this.refreshActivityStates();
-    }, 400);
+    }, ACTIVITY_TICK_INTERVAL);
   }
 
   private autoConnectSavedDevices(): void {
@@ -392,6 +423,16 @@ struct Index {
       this.activityTimer = -1;
     }
     this.saveStylePrefs();
+    if (this.styleSaveTimer >= 0) {
+      clearTimeout(this.styleSaveTimer);
+      this.styleSaveTimer = -1;
+    }
+    if (this.activityInspectionTimer >= 0) {
+      clearTimeout(this.activityInspectionTimer);
+      this.activityInspectionTimer = -1;
+    }
+    this.activityInspectionGeneration++;
+    this.activityInspectionInFlight = false;
     if (this.sessionSaveTimer >= 0) {
       clearTimeout(this.sessionSaveTimer);
       this.sessionSaveTimer = -1;
@@ -406,19 +447,96 @@ struct Index {
   private refreshActivityStates(): void {
     const now = Date.now();
     for (const session of this.sessions) {
-      if (!session.isAgentSession()) {
-        continue;
+      if (session.isAgentSession()) {
+        session.updateActivity(now);
       }
-      if (session.id > 0) {
-        try {
-          const process = libterminal.inspectSession(session.id) as SessionProcessInfo;
-          session.updateProcess(process);
-        } catch (e) {
-          session.processSignalAvailable = false;
-        }
-      }
-      session.updateActivity(now);
     }
+    if (this.activityInspectionInFlight || this.sessions.length === 0) {
+      return;
+    }
+
+    let candidate: TerminalSession | null = null;
+    const active = this.currentSession();
+    if (active !== null && active.isAgentSession() && active.id > 0 && active.alive &&
+      now - active.lastProcessInspectionAt >= ACTIVE_PROCESS_INSPECTION_INTERVAL) {
+      candidate = active;
+    } else {
+      const count = this.sessions.length;
+      for (let offset = 0; offset < count; offset++) {
+        const index = (this.activityScanCursor + offset) % count;
+        const session = this.sessions[index];
+        if (!session.isAgentSession() || session.id <= 0 || !session.alive) {
+          continue;
+        }
+        const interval = session.uid === (active === null ? -1 : active.uid) ?
+          ACTIVE_PROCESS_INSPECTION_INTERVAL : BACKGROUND_PROCESS_INSPECTION_INTERVAL;
+        if (now - session.lastProcessInspectionAt < interval) {
+          continue;
+        }
+        candidate = session;
+        this.activityScanCursor = (index + 1) % count;
+        break;
+      }
+    }
+    if (candidate === null) {
+      return;
+    }
+
+    const expectedUid = candidate.uid;
+    const expectedNativeId = candidate.id;
+    candidate.lastProcessInspectionAt = now;
+    this.activityInspectionInFlight = true;
+    this.activityInspectionGeneration++;
+    const inspectionGeneration = this.activityInspectionGeneration;
+    if (this.activityInspectionTimer >= 0) {
+      clearTimeout(this.activityInspectionTimer);
+    }
+    this.activityInspectionTimer = setTimeout(() => {
+      if (this.activityInspectionGeneration !== inspectionGeneration) {
+        return;
+      }
+      this.activityInspectionTimer = -1;
+      this.activityInspectionGeneration++;
+      this.activityInspectionInFlight = false;
+      const session = this.sessions.find((item: TerminalSession) =>
+        item.uid === expectedUid && item.id === expectedNativeId && !item.disposed);
+      if (session !== undefined) {
+        session.processSignalAvailable = false;
+      }
+      console.error('TERMINAI async process inspection timed out');
+    }, PROCESS_INSPECTION_TIMEOUT);
+    const inspection: Promise<SessionProcessInfo> = libterminal.inspectSessionAsync(expectedNativeId);
+    inspection.then((process: SessionProcessInfo) => {
+      if (this.activityInspectionGeneration !== inspectionGeneration) {
+        return;
+      }
+      if (this.activityInspectionTimer >= 0) {
+        clearTimeout(this.activityInspectionTimer);
+        this.activityInspectionTimer = -1;
+      }
+      const session = this.sessions.find((item: TerminalSession) =>
+        item.uid === expectedUid && item.id === expectedNativeId && !item.disposed);
+      if (session !== undefined) {
+        session.updateProcess(process);
+        session.updateActivity(Date.now());
+      }
+      this.activityInspectionInFlight = false;
+    }).catch((error: Error) => {
+      if (this.activityInspectionGeneration !== inspectionGeneration) {
+        return;
+      }
+      if (this.activityInspectionTimer >= 0) {
+        clearTimeout(this.activityInspectionTimer);
+        this.activityInspectionTimer = -1;
+      }
+      const session = this.sessions.find((item: TerminalSession) =>
+        item.uid === expectedUid && item.id === expectedNativeId && !item.disposed);
+      if (session !== undefined) {
+        session.processSignalAvailable = false;
+      }
+      this.activityInspectionInFlight = false;
+      console.error('TERMINAI async process inspection failed: ' + error.message);
+    });
   }
 
   private saveCustomAgents(value: string): void {
@@ -559,12 +677,10 @@ struct Index {
     if (id <= 0) {
       return;
     }
-    setTimeout(() => {
-      try {
-        libterminal.killSession(id);
-      } catch (e) {
-      }
-    }, 200);
+    libterminal.killSessionAsync(id)
+      .catch((error: Error) => {
+        console.error('TERMINAI async native session cleanup failed: ' + error.message);
+      });
   }
 
   private disconnectDevice(deviceId: string, removeRuntime: boolean = false): void {
@@ -1103,13 +1219,27 @@ struct Index {
 
   onThemeModeChanged(): void {
     this.applyIsDark();
+    this.scheduleStylePrefsSave();
   }
 
   onStyleChanged(): void {
     if (this.loadingStylePrefs) {
       return;
     }
-    this.saveStylePrefs();
+    this.scheduleStylePrefsSave();
+  }
+
+  private scheduleStylePrefsSave(): void {
+    if (this.loadingStylePrefs) {
+      return;
+    }
+    if (this.styleSaveTimer >= 0) {
+      clearTimeout(this.styleSaveTimer);
+    }
+    this.styleSaveTimer = setTimeout(() => {
+      this.styleSaveTimer = -1;
+      this.saveStylePrefs();
+    }, STYLE_SAVE_DELAY);
   }
 
   /** Record a successfully used start path (newest first, max 5). */
@@ -1192,6 +1322,7 @@ struct Index {
       s.name = restoredTitle;
       s.manualTitle = restoredManualTitle;
     }
+    s.onNativeEvent = (event: SessionEvent) => { this.mgr.dispatch(event); };
     s.onStateChanged = () => {
       if (!s.alive) {
         // session exited: notify only if user isn't looking at it
@@ -1204,8 +1335,8 @@ struct Index {
       // Keep exited sessions visible until the user closes them so the
       // "会话已退出" state remains truthful and recoverable.
       this.sessions = [...this.sessions];
-      this.saveSessionsSoon();
     };
+    s.onMetadataChanged = () => { this.saveSessionsSoon(); };
     s.onCwdChanged = () => {
       this.sessions = [...this.sessions];
       this.saveSessionsSoon();
@@ -1226,6 +1357,7 @@ struct Index {
     const selectedUid = selected === null ? -1 : selected.uid;
     this.mgr.remove(s);
     this.sessions = [...this.mgr.sessions];
+    this.renderedSessionUids = this.renderedSessionUids.filter((uid: number) => uid !== s.uid);
     if (this.sessions.length === 0) {
       this.currentIdx = -1;
     } else if (selectedUid >= 0 && selectedUid !== s.uid) {
@@ -1576,7 +1708,7 @@ struct Index {
 
           // Terminal stack: all sessions mounted, only current visible.
           Stack() {
-            ForEach(this.sessions, (s: TerminalSession) => {
+            ForEach(this.renderedSessions(), (s: TerminalSession) => {
               Column() {
                 TerminalView({
                   session: s,

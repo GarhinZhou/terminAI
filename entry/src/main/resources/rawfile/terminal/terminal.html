@@ -13,6 +13,7 @@
 <div id="terminal"></div>
 <script src="xterm.js"></script>
 <script src="addon-fit.js"></script>
+<script src="addon-serialize.js"></script>
 <script>
 (function () {
   var term = new Terminal({
@@ -27,7 +28,9 @@
     }
   });
   var fitAddon = new FitAddon.FitAddon();
+  var serializeAddon = new SerializeAddon.SerializeAddon();
   term.loadAddon(fitAddon);
+  term.loadAddon(serializeAddon);
   term.open(document.getElementById('terminal'));
   fitAddon.fit();
 
@@ -41,6 +44,76 @@
   var replayEndRequested = false;
   var writesAfterReplay = [];
   var outputPort = null;
+  var visualFitFrame = 0;
+  var lastPtyCols = term.cols;
+  var lastPtyRows = term.rows;
+  var pendingPtyCols = term.cols;
+  var pendingPtyRows = term.rows;
+  var ptyResizeTimer = 0;
+  var ptyResizeSettleTimer = 0;
+  var lastPtyResizeAt = 0;
+  var PTY_RESIZE_INTERVAL = 80;
+  var PTY_RESIZE_SETTLE = 130;
+  var CHECKPOINT_LIMIT = 1024 * 1024;
+
+  // Resize xterm's local grid in the next animation frame so the terminal
+  // follows the ArkUI container in real time. ResizeObserver bursts are folded
+  // into one fit per visual frame, keeping cursor and text geometry in sync.
+  function fitTerminalImmediate() {
+    if (visualFitFrame) {
+      cancelAnimationFrame(visualFitFrame);
+      visualFitFrame = 0;
+    }
+    try {
+      fitAddon.fit();
+      return term.cols + ',' + term.rows;
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function scheduleVisualFit() {
+    if (visualFitFrame) return term.cols + ',' + term.rows;
+    visualFitFrame = requestAnimationFrame(function () {
+      visualFitFrame = 0;
+      try { fitAddon.fit(); } catch (e) {}
+    });
+    return term.cols + ',' + term.rows;
+  }
+
+  function commitPtyResize() {
+    if (ptyResizeTimer) {
+      clearTimeout(ptyResizeTimer);
+      ptyResizeTimer = 0;
+    }
+    if (pendingPtyCols === lastPtyCols && pendingPtyRows === lastPtyRows) return;
+    if (window.ohosBridge) {
+      lastPtyCols = pendingPtyCols;
+      lastPtyRows = pendingPtyRows;
+      lastPtyResizeAt = Date.now();
+      window.ohosBridge.onTermResize(lastPtyCols, lastPtyRows);
+    }
+  }
+
+  // Keep the visual grid at browser-frame speed, but limit SIGWINCH traffic to
+  // about 12.5Hz. Full-screen agents often redraw their whole interface after
+  // each PTY resize; the trailing commit preserves the exact final dimensions.
+  function notifyPtyResize(cols, rows) {
+    pendingPtyCols = cols;
+    pendingPtyRows = rows;
+    if (cols === lastPtyCols && rows === lastPtyRows) return;
+    var elapsed = Date.now() - lastPtyResizeAt;
+    if (elapsed >= PTY_RESIZE_INTERVAL) {
+      commitPtyResize();
+    } else if (!ptyResizeTimer) {
+      ptyResizeTimer = setTimeout(commitPtyResize, PTY_RESIZE_INTERVAL - elapsed);
+    }
+    if (ptyResizeSettleTimer) clearTimeout(ptyResizeSettleTimer);
+    ptyResizeSettleTimer = setTimeout(function () {
+      ptyResizeSettleTimer = 0;
+      commitPtyResize();
+    }, PTY_RESIZE_SETTLE);
+  }
 
   function isReplayGeneratedResponse(data) {
     if (!data || data.charAt(0) !== '\x1b') return false;
@@ -51,9 +124,30 @@
       /^\x1bP[01][+$]r/.test(data);
   }
 
+  function createTerminalCheckpoint(cursor) {
+    var scrollbackCandidates = [2000, 1000, 500, 100, 0];
+    for (var index = 0; index < scrollbackCandidates.length; index++) {
+      try {
+        var serialized = serializeAddon.serialize({ scrollback: scrollbackCandidates[index] });
+        if (serialized && serialized.length <= CHECKPOINT_LIMIT) {
+          if (outputPort) outputPort.postMessage('C' + cursor + '\n' + serialized);
+          return;
+        }
+      } catch (e) {
+        return;
+      }
+    }
+  }
+
   function acknowledgePortWrite(token) {
     if (outputPort) {
       try { outputPort.postMessage('A' + token); } catch (e) {}
+    }
+  }
+
+  function acknowledgeReplayChunk(token) {
+    if (outputPort) {
+      try { outputPort.postMessage('R' + token); } catch (e) {}
     }
   }
 
@@ -88,12 +182,12 @@
       writeQueuedItem(queued[i]);
     }
     if (outputPort) {
-      try { outputPort.postMessage('H'); } catch (e) {}
+      try { outputPort.postMessage('H' + generation); } catch (e) {}
     }
   }
 
-  function beginHistoryReplay() {
-    replayGeneration++;
+  function beginHistoryReplay(generation) {
+    replayGeneration = generation;
     replayingHistory = true;
     replayPendingWrites = 0;
     replayEndRequested = false;
@@ -101,26 +195,28 @@
     term.reset();
   }
 
-  function writeHistoryReplayChunk(data) {
-    if (!replayingHistory || !data) return;
-    var generation = replayGeneration;
+  function writeHistoryReplayChunk(generation, data) {
+    if (!replayingHistory || generation !== replayGeneration || !data) return;
+    var activeGeneration = replayGeneration;
     replayPendingWrites++;
     try {
       term.write(data, function () {
-        if (generation !== replayGeneration) return;
+        if (activeGeneration !== replayGeneration) return;
         replayPendingWrites--;
-        finishHistoryReplay(generation);
+        acknowledgeReplayChunk(activeGeneration);
+        finishHistoryReplay(activeGeneration);
       });
     } catch (e) {
-      if (generation === replayGeneration) {
+      if (activeGeneration === replayGeneration) {
         replayPendingWrites--;
-        finishHistoryReplay(generation);
+        acknowledgeReplayChunk(activeGeneration);
+        finishHistoryReplay(activeGeneration);
       }
     }
   }
 
-  function endHistoryReplay() {
-    if (!replayingHistory) return;
+  function endHistoryReplay(generation) {
+    if (!replayingHistory || generation !== replayGeneration) return;
     replayEndRequested = true;
     finishHistoryReplay(replayGeneration);
   }
@@ -141,11 +237,19 @@
           writeAfterReplay(payload.substring(separator + 1), payload.substring(0, separator));
         }
       } else if (kind === 'B') {
-        beginHistoryReplay();
+        beginHistoryReplay(parseInt(payload, 10));
       } else if (kind === 'R') {
-        writeHistoryReplayChunk(payload);
+        var replaySeparator = payload.indexOf('\n');
+        if (replaySeparator > 0) {
+          var replayToken = parseInt(payload.substring(0, replaySeparator), 10);
+          writeHistoryReplayChunk(replayToken, payload.substring(replaySeparator + 1));
+        }
       } else if (kind === 'E') {
-        endHistoryReplay();
+        endHistoryReplay(parseInt(payload, 10));
+      } else if (kind === 'Q') {
+        try { outputPort.postMessage('q' + payload); } catch (e) {}
+      } else if (kind === 'S') {
+        createTerminalCheckpoint(payload);
       }
     };
     outputPort.onmessageerror = function () {
@@ -160,7 +264,7 @@
     if (window.ohosBridge) window.ohosBridge.onTermInput(data);
   });
   term.onResize(function (size) {
-    if (window.ohosBridge) window.ohosBridge.onTermResize(size.cols, size.rows);
+    notifyPtyResize(size.cols, size.rows);
   });
   if (term.onTitleChange) {
     term.onTitleChange(function (title) {
@@ -191,10 +295,11 @@
     }, 220);
   });
 
-  // Refit when the container size changes (window drag, sidebar toggle).
+  // Coalesce ResizeObserver bursts to one visual fit per browser frame. This
+  // keeps text/cursor geometry accurate without stretching the Web surface.
   if (window.ResizeObserver) {
     new ResizeObserver(function () {
-      try { fitAddon.fit(); } catch (e) {}
+      scheduleVisualFit();
     }).observe(document.getElementById('terminal'));
   }
 
@@ -202,9 +307,10 @@
   window.termWrite = function (data) { writeAfterReplay(data, ''); };
   window.termReplay = function (data) {
     try {
-      beginHistoryReplay();
-      writeHistoryReplayChunk(data);
-      endHistoryReplay();
+      var generation = replayGeneration + 1;
+      beginHistoryReplay(generation);
+      writeHistoryReplayChunk(generation, data);
+      endHistoryReplay(generation);
     } catch (e) {
       replayEndRequested = true;
       replayPendingWrites = 0;
@@ -251,14 +357,14 @@
       term.options.theme = sc;
       document.documentElement.style.background = sc.background;
       document.body.style.background = sc.background;
-      fitAddon.fit();
+      fitTerminalImmediate();
     } catch (e) {}
   };
   window.termSetScrollback = function (lines) {
     try { term.options.scrollback = lines; } catch (e) {}
   };
   window.termFitNow = function () {
-    try { fitAddon.fit(); return term.cols + ',' + term.rows; } catch (e) { return ''; }
+    return fitTerminalImmediate();
   };
   window.termClear = function () { term.clear(); };
   window.termFocus = function () { term.focus(); };
