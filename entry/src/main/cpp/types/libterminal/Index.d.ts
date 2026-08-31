@@ -48,9 +48,9 @@ export const createSession: (cols: number, rows: number, cwd: string, cmd: strin
   callback: (event: SessionEvent) => void) => number;
 
 /**
- * Create the hidden SSH master PTY and answer its first password prompt in
- * native code. The secret is never placed in argv/environment and is erased
- * immediately after use or successful key authentication.
+ * Create an SSH PTY and answer its first password/private-key passphrase
+ * prompt in native code. The secret is never placed in argv/environment and
+ * is erased immediately after use or successful key authentication.
  */
 export const createSessionWithSecret: (cols: number, rows: number, cwd: string, cmd: string,
   secret: string, callback: (event: SessionEvent) => void) => number;
@@ -81,3 +81,6 @@ export const listPrograms: () => ProgramInfo[];
 
 /** List subdirectory names of a path (for the inline directory browser). */
 export const listDirs: (path: string) => string[];
+
+/** Restrict a regular sandbox file to owner read/write (0600). */
+export const securePrivateFile: (path: string) => boolean;

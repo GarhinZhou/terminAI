@@ -185,7 +185,7 @@ export struct SidebarView {
       return s.agentKind;
     }
     if (s.cmd.length === 0) {
-      return 'zsh';
+      return s.shellName.length > 0 ? s.shellName : 'zsh';
     }
     const parts = s.cmd.split('/');
     return parts.length > 0 ? parts[parts.length - 1] : s.cmd;
@@ -241,9 +241,14 @@ export struct SidebarView {
     return this.accentOf();
   }
 
-  private spaces(): SpaceLite[] {
+  /**
+   * Keep the source array as an explicit argument. ArkUI V1 then records the
+   * @Link read at the build call site, including remote sessions appended
+   * asynchronously after SSH initialization.
+   */
+  private spaces(source: TerminalSession[]): SpaceLite[] {
     const result: SpaceLite[] = [];
-    for (const session of this.sessions) {
+    for (const session of source) {
       if (!this.matchesDevice(session)) {
         continue;
       }
@@ -310,18 +315,18 @@ export struct SidebarView {
     return session.deviceId + '\t' + canonicalSessionCwd(session);
   }
 
-  private scopeSessionCount(): number {
-    return this.sessions.filter((session: TerminalSession) => this.matchesDevice(session)).length;
+  private scopeSessionCount(source: TerminalSession[]): number {
+    return source.filter((session: TerminalSession) => this.matchesDevice(session)).length;
   }
 
-  private agents(): TerminalSession[] {
-    return this.sessions.filter((session: TerminalSession) =>
+  private agents(source: TerminalSession[]): TerminalSession[] {
+    return source.filter((session: TerminalSession) =>
       session.cmd.length > 0 && this.matchesDevice(session) &&
       (this.selectedSpace.length === 0 || this.sessionSpaceKey(session) === this.selectedSpace));
   }
 
-  private shells(): TerminalSession[] {
-    return this.sessions.filter((session: TerminalSession) =>
+  private shells(source: TerminalSession[]): TerminalSession[] {
+    return source.filter((session: TerminalSession) =>
       session.cmd.length === 0 && this.matchesDevice(session) &&
       (this.selectedSpace.length === 0 || this.sessionSpaceKey(session) === this.selectedSpace));
   }
@@ -790,38 +795,72 @@ export struct SidebarView {
   shellRow(item: TerminalSession) {
     Row() {
       SessionSelectionMark({ selected: this.isSessionSelected(item), accent: this.accentOf() })
-      UiIcon({
-        name: IconName.Terminal,
-        iconSize: 14,
-        color: this.isSessionSelected(item) ? this.accentOf() : Theme.tertiary(this.isDark)
-      })
-        .margin({ right: 8 })
-      SessionTitleLabel({
-        session: item,
-        maxWidth: Math.max(70, this.sidebarWidth - 145)
-      })
-      SessionNumberBadge({ value: item.sequence, isDark: this.isDark })
-        .margin({ left: 6 })
-      Blank()
-      if (this.selectedDeviceId.length === 0) {
-        Text(item.deviceName)
-          .fontSize(9.5)
-          .fontWeight(FontWeight.Medium)
-          .fontColor(this.deviceTagTextColor())
-          .height(18)
-          .padding({ left: 5, right: 5 })
-          .backgroundColor(this.deviceTagBackground(item.deviceId))
-          .borderRadius(5)
-          .margin({ right: 4 })
+      Column() {
+        Row() {
+          SessionTitleLabel({
+            session: item,
+            maxWidth: Math.max(80, this.sidebarWidth - 100),
+            medium: true
+          })
+          Blank()
+          SessionNumberBadge({ value: item.sequence, isDark: this.isDark })
+        }
+        .width('100%')
+
+        Row() {
+          Row() {
+            UiIcon({
+              name: IconName.Folder,
+              iconSize: 10,
+              color: this.isSessionSelected(item) ? this.accentOf() : Theme.tertiary(this.isDark)
+            })
+            Text(this.displayCwd(canonicalSessionCwd(item)))
+              .fontSize(12)
+              .fontColor(Theme.tertiary(this.isDark))
+              .margin({ left: 4 })
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+          }
+          .height(20)
+          .padding({ left: 6, right: 6 })
+          .constraintSize({
+            maxWidth: Math.max(80, this.sidebarWidth -
+              (this.selectedDeviceId.length === 0 ? 108 : 54))
+          })
+          .backgroundColor(Theme.input(this.isDark))
+          .borderRadius(6)
+          Blank()
+          if (item.unread) {
+            Circle({ width: 6, height: 6 })
+              .fill(this.accentOf())
+              .margin({ left: 4 })
+              .accessibilityText('有新输出')
+          }
+          if (this.selectedDeviceId.length === 0) {
+            Text(item.deviceName)
+              .fontSize(9.5)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(this.deviceTagTextColor())
+              .height(18)
+              .padding({ left: 5, right: 5 })
+              .backgroundColor(this.deviceTagBackground(item.deviceId))
+              .borderRadius(5)
+              .margin({ left: 4 })
+          }
+          this.moreButton(item)
+        }
+        .width('100%')
+        .margin({ top: 5 })
       }
-      this.moreButton(item)
+      .layoutWeight(1)
+      .alignItems(HorizontalAlign.Start)
     }
     .width('100%')
-    .height(38)
+    .height(58)
     .padding({ left: 9, right: 6 })
-    .borderRadius(8)
+    .borderRadius(9)
     .backgroundColor(this.rowBackground(this.sessionKey('shell_', item), this.isSessionSelected(item)))
-    .border({ width: this.focusWidth(this.sessionKey('shell_', item)), color: this.accentOf(), radius: 8 })
+    .border({ width: this.focusWidth(this.sessionKey('shell_', item)), color: this.accentOf(), radius: 9 })
     .scale({
       x: this.rowScale(this.sessionKey('shell_', item)),
       y: this.rowScale(this.sessionKey('shell_', item))
@@ -840,7 +879,8 @@ export struct SidebarView {
     .onTouch((event: TouchEvent) => { this.onTouchFeedback(this.sessionKey('shell_', item), event); })
     .onClick(() => { this.onSelectSession(item.uid); })
     .bindContextMenu(this.contextMenuBuilder, ResponseType.RightClick)
-    .accessibilityText('终端 ' + item.name + ' ' + item.sequence.toString())
+    .accessibilityText('终端 ' + item.name + ' ' + item.sequence.toString() + '，空间 ' +
+      this.displayCwd(canonicalSessionCwd(item)) + '，设备 ' + item.deviceName)
     .accessibilitySelected(this.isSessionSelected(item))
   }
 
@@ -875,9 +915,10 @@ export struct SidebarView {
       })
   }
 
+  /** Read @Link sessions directly: @Builder value parameters are not reactive in ArkUI V1. */
   @Builder
-  agentRows(items: TerminalSession[]) {
-    if (items.length === 0) {
+  agentRows() {
+    if (this.agents(this.sessions).length === 0) {
       Row() {
         UiIcon({ name: IconName.Spark, iconSize: 13, color: Theme.faintText(this.isDark) })
         Text('此空间中暂无智能体')
@@ -889,7 +930,7 @@ export struct SidebarView {
       .height(34)
       .padding({ left: 9 })
     } else {
-      ForEach(items, (item: TerminalSession) => {
+      ForEach(this.agents(this.sessions), (item: TerminalSession) => {
         if (this.renamingUid === item.uid) {
           this.renamingRow(item)
         } else {
@@ -899,9 +940,10 @@ export struct SidebarView {
     }
   }
 
+  /** Keep remote terminal additions observable after the asynchronous SSH restore completes. */
   @Builder
-  shellRows(items: TerminalSession[]) {
-    if (items.length === 0) {
+  shellRows() {
+    if (this.shells(this.sessions).length === 0) {
       Row() {
         UiIcon({ name: IconName.Terminal, iconSize: 13, color: Theme.faintText(this.isDark) })
         Text('此空间中暂无终端')
@@ -913,7 +955,7 @@ export struct SidebarView {
       .height(34)
       .padding({ left: 9 })
     } else {
-      ForEach(items, (item: TerminalSession) => {
+      ForEach(this.shells(this.sessions), (item: TerminalSession) => {
         if (this.renamingUid === item.uid) {
           this.renamingRow(item)
         } else {
@@ -938,7 +980,7 @@ export struct SidebarView {
         .fontColor(this.selectedSpace.length === 0 ?
           Theme.text(this.isDark) : Theme.subText(this.isDark))
         .layoutWeight(1)
-      Text(this.scopeSessionCount().toString())
+      Text(this.scopeSessionCount(this.sessions).toString())
         .fontSize(12)
         .fontColor(Theme.faintText(this.isDark))
     }
@@ -961,7 +1003,7 @@ export struct SidebarView {
       AppStorage.setOrCreate('selectedSpace', '');
     })
     .accessibilityGroup(true)
-    .accessibilityText('全部空间，' + this.scopeSessionCount().toString() + ' 个会话')
+    .accessibilityText('全部空间，' + this.scopeSessionCount(this.sessions).toString() + ' 个会话')
     .accessibilitySelected(this.selectedSpace.length === 0)
   }
 
@@ -1032,7 +1074,7 @@ export struct SidebarView {
             if (this.spacesExpanded) {
               this.allSpacesRow()
 
-              ForEach(this.spaces(), (space: SpaceLite) => {
+              ForEach(this.spaces(this.sessions), (space: SpaceLite) => {
                 this.spaceRow(space)
               }, (space: SpaceLite) => space.key())
             }
@@ -1046,7 +1088,7 @@ export struct SidebarView {
             this.sectionHeader(IconName.Agents, '智能体', 'agents_header',
               () => { this.agentsExpanded = !this.agentsExpanded; })
             if (this.agentsExpanded) {
-              this.agentRows(this.agents())
+              this.agentRows()
             }
           }
           .width('100%')
@@ -1058,7 +1100,7 @@ export struct SidebarView {
             this.sectionHeader(IconName.Terminal, '终端', 'terminals_header',
               () => { this.terminalsExpanded = !this.terminalsExpanded; })
             if (this.terminalsExpanded) {
-              this.shellRows(this.shells())
+              this.shellRows()
             }
           }
           .width('100%')

@@ -6,6 +6,9 @@ import { IconName, UiIcon } from '../common/Icons';
 import { CustomAgentInfo, decodeCustomAgents, encodeCustomAgents } from '../model/CustomAgent';
 import { ManagedDevice, decodeDevices, LOCAL_DEVICE_ID } from '../model/ManagedDevice';
 import { overridesForDevice, setOverridesForDevice } from '../model/AgentOverrides';
+import { notificationManager } from '@kit.NotificationKit';
+import { common } from '@kit.AbilityKit';
+import { SessionNotificationService } from '../model/SessionNotificationService';
 
 interface KindRow {
   kind: string;
@@ -51,7 +54,7 @@ export struct SettingsView {
   @StorageLink('lineHeight') lineHeight: number = 1.0;
   @StorageLink('fontFamily') fontFamily: string = '';
   @StorageLink('themeMode') themeMode: string = 'system';
-  @StorageLink('notifyEnabled') notifyEnabled: boolean = true;
+  @StorageLink('notifyEnabled') notifyEnabled: boolean = false;
   @StorageLink('autoConnectSsh') autoConnectSsh: boolean = false;
   @StorageLink('cursorStyle') cursorStyle: string = 'block';
   @StorageLink('colorScheme') colorScheme: string = 'default';
@@ -70,6 +73,8 @@ export struct SettingsView {
   @State private customAgentCommand: string = '';
   @State private deviceOptions: ManagedDevice[] = [];
   @State private selectedDevice: string = LOCAL_DEVICE_ID;
+  @State private notificationAuthorized: boolean = false;
+  @State private notificationBusy: boolean = false;
   private contentScroller: Scroller = new Scroller();
 
   private kinds: KindRow[] = [
@@ -106,11 +111,115 @@ export struct SettingsView {
     }
     this.loadDrafts();
     this.loadCustomAgents();
+    this.refreshNotificationAuthorization();
     if (this.settingsTargetCustomAgent) {
       setTimeout(() => {
         this.contentScroller.scrollEdge(Edge.Bottom);
         setTimeout(() => { this.focusCustomAgentEditor(); }, 0);
       }, 80);
+    }
+  }
+
+  private async refreshNotificationAuthorization(): Promise<void> {
+    this.notificationBusy = true;
+    try {
+      this.notificationAuthorized = await notificationManager.isNotificationEnabled();
+      if (!this.notificationAuthorized) {
+        this.notifyEnabled = false;
+      }
+    } catch (error) {
+      this.notificationAuthorized = false;
+      console.error('TERMINAI check notification permission failed: ' + JSON.stringify(error));
+    } finally {
+      this.notificationBusy = false;
+    }
+  }
+
+  private notificationContext(): common.UIAbilityContext | undefined {
+    const context = this.getUIContext().getHostContext();
+    if (context === undefined) {
+      return undefined;
+    }
+    return context as common.UIAbilityContext;
+  }
+
+  private showNotificationToast(message: string): void {
+    try {
+      this.getUIContext().getPromptAction().showToast({ message: message });
+    } catch (error) {
+      console.error('TERMINAI show notification toast failed: ' + JSON.stringify(error));
+    }
+  }
+
+  private async changeNotificationsEnabled(on: boolean): Promise<void> {
+    this.notifyEnabled = on;
+    if (!on) {
+      SessionNotificationService.cancelAll();
+      return;
+    }
+    this.notificationBusy = true;
+    try {
+      let authorized = await notificationManager.isNotificationEnabled();
+      if (!authorized) {
+        const context = this.notificationContext();
+        if (context === undefined) {
+          throw new Error('UIAbilityContext unavailable');
+        }
+        await notificationManager.requestEnableNotification(context);
+        // requestEnableNotification may report success after an earlier denial;
+        // the real system switch is authoritative.
+        authorized = await notificationManager.isNotificationEnabled();
+      }
+      this.notificationAuthorized = authorized;
+      this.notifyEnabled = authorized;
+      if (!authorized) {
+        this.showNotificationToast('系统通知仍未开启，请点击“系统设置”授权');
+      }
+    } catch (error) {
+      this.notificationAuthorized = false;
+      this.notifyEnabled = false;
+      this.showNotificationToast('通知授权未开启');
+      console.error('TERMINAI request notification permission failed: ' + JSON.stringify(error));
+    } finally {
+      this.notificationBusy = false;
+    }
+  }
+
+  private async openNotificationSettings(): Promise<void> {
+    const context = this.notificationContext();
+    if (context === undefined) {
+      return;
+    }
+    this.notificationBusy = true;
+    try {
+      await notificationManager.openNotificationSettings(context);
+      this.notificationAuthorized = await notificationManager.isNotificationEnabled();
+      if (!this.notificationAuthorized) {
+        this.notifyEnabled = false;
+      }
+    } catch (error) {
+      console.error('TERMINAI open notification settings failed: ' + JSON.stringify(error));
+    } finally {
+      this.notificationBusy = false;
+    }
+  }
+
+  private async sendTestNotification(): Promise<void> {
+    this.notificationBusy = true;
+    try {
+      const sent = await SessionNotificationService.publishTest();
+      this.notificationAuthorized = sent;
+      if (sent) {
+        this.showNotificationToast('测试通知已发送');
+      } else {
+        this.notifyEnabled = false;
+        this.showNotificationToast('请先开启系统通知权限');
+      }
+    } catch (error) {
+      this.showNotificationToast('测试通知发送失败');
+      console.error('TERMINAI publish test notification failed: ' + JSON.stringify(error));
+    } finally {
+      this.notificationBusy = false;
     }
   }
 
@@ -212,7 +321,12 @@ export struct SettingsView {
     .justifyContent(FlexAlign.Center)
     .backgroundColor(this.tab === idx ? Theme.selected(this.isDark) : '#00000000')
     .borderRadius(9)
-    .onClick(() => { this.tab = idx; })
+    .onClick(() => {
+      this.tab = idx;
+      if (idx === 3) {
+        this.refreshNotificationAuthorization();
+      }
+    })
     .accessibilityText(label)
     .accessibilitySelected(this.tab === idx)
   }
@@ -697,7 +811,71 @@ export struct SettingsView {
                   .margin({ right: 10 })
                 Toggle({ type: ToggleType.Switch, isOn: this.notifyEnabled })
                   .selectedColor(Theme.accent(this.isDark))
-                  .onChange((on: boolean) => { this.notifyEnabled = on; })
+                  .enabled(!this.notificationBusy)
+                  .onChange((on: boolean) => { this.changeNotificationsEnabled(on); })
+              }
+              .width('100%')
+              .height(46)
+              .padding({ left: 12, right: 12 })
+              this.cardDivider()
+              Row() {
+                Text('HarmonyOS 系统通知')
+                  .fontSize(15)
+                  .fontColor(Theme.text(this.isDark))
+                  .layoutWeight(1)
+                  .margin({ right: 10 })
+                Row() {
+                  Circle()
+                    .width(7)
+                    .height(7)
+                    .fill(this.notificationAuthorized ?
+                      Theme.success(this.isDark) : Theme.warning(this.isDark))
+                  Text(this.notificationBusy ? '检查中' :
+                    (this.notificationAuthorized ? '已授权' : '未授权'))
+                    .fontSize(12)
+                    .fontColor(this.notificationAuthorized ?
+                      Theme.success(this.isDark) : Theme.warning(this.isDark))
+                    .margin({ left: 5 })
+                }
+                .margin({ right: 8 })
+                Button('检查', { type: ButtonType.Capsule, stateEffect: true })
+                  .fontSize(12)
+                  .fontColor(Theme.text(this.isDark))
+                  .height(28)
+                  .padding({ left: 9, right: 9 })
+                  .margin({ right: 6 })
+                  .backgroundColor(Theme.button(this.isDark))
+                  .enabled(!this.notificationBusy)
+                  .onClick(() => { this.refreshNotificationAuthorization(); })
+                Button('系统设置', { type: ButtonType.Capsule, stateEffect: true })
+                  .fontSize(12)
+                  .fontColor(Theme.text(this.isDark))
+                  .height(28)
+                  .padding({ left: 10, right: 10 })
+                  .backgroundColor(Theme.button(this.isDark))
+                  .enabled(!this.notificationBusy)
+                  .onClick(() => { this.openNotificationSettings(); })
+              }
+              .width('100%')
+              .height(46)
+              .padding({ left: 12, right: 12 })
+              this.cardDivider()
+              Row() {
+                Text('验证通知显示和点击返回')
+                  .fontSize(15)
+                  .fontColor(Theme.text(this.isDark))
+                  .layoutWeight(1)
+                  .margin({ right: 10 })
+                Button('发送测试通知', { type: ButtonType.Capsule, stateEffect: true })
+                  .fontSize(12)
+                  .fontColor(this.notifyEnabled && this.notificationAuthorized ?
+                    Theme.onAccent(this.isDark) : Theme.faintText(this.isDark))
+                  .height(28)
+                  .padding({ left: 11, right: 11 })
+                  .backgroundColor(this.notifyEnabled && this.notificationAuthorized ?
+                    Theme.accent(this.isDark) : Theme.button(this.isDark))
+                  .enabled(this.notifyEnabled && this.notificationAuthorized && !this.notificationBusy)
+                  .onClick(() => { this.sendTestNotification(); })
               }
               .width('100%')
               .height(46)
@@ -721,8 +899,8 @@ export struct SettingsView {
             .backgroundColor(Theme.input(this.isDark))
             .borderRadius(10)
             .padding({ top: 2, bottom: 2 })
-            this.caption('仅当你没有查看相应会话时，才会发送任务完成通知。')
-            this.caption('可能还需要在 HarmonyOS 系统设置中授予通知权限。')
+            this.caption('智能体等待输入、返回 Shell 或会话退出时通知；正在查看的会话不会打扰。')
+            this.caption('系统授权与应用内开关都会生效；拒绝过授权后可从上方打开系统设置。')
           } else {
             // ── About ──
             Column() {

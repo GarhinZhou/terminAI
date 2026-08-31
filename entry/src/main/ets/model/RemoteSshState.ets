@@ -4,7 +4,7 @@ export enum SshConnectionState {
   Scanning = '扫描智能体',
   Connected = '已连接',
   ConnectedScanFailed = '已连接（扫描失败）',
-  NeedsPassword = '需要密码',
+  NeedsCredential = '需要凭据',
   AuthFailed = '认证失败',
   Failed = '连接失败'
 }
@@ -23,7 +23,7 @@ export class RemoteAgentInfo {
   }
 }
 
-/** Mutable holder lets the connection callback erase the in-memory password after use. */
+/** Mutable holder lets the connection callback erase the in-memory SSH secret after use. */
 export class SshSecretValue {
   value: string = '';
 
@@ -65,7 +65,7 @@ export class SshRuntimeConnection {
   state: SshConnectionState = SshConnectionState.Disconnected;
   masterId: number = -1;
   scanId: number = -1;
-  passwordSent: boolean = false;
+  credentialAvailable: boolean = false;
   connectedMarkerSeen: boolean = false;
   openTerminalOnReady: boolean = false;
   authOutput: string = '';
@@ -110,7 +110,9 @@ export function connectionStateOf(value: string, deviceId: string): SshConnectio
         if (state === SshConnectionState.Scanning) return SshConnectionState.Scanning;
         if (state === SshConnectionState.Connected) return SshConnectionState.Connected;
         if (state === SshConnectionState.ConnectedScanFailed) return SshConnectionState.ConnectedScanFailed;
-        if (state === SshConnectionState.NeedsPassword) return SshConnectionState.NeedsPassword;
+        if (state === SshConnectionState.NeedsCredential || state === '需要密码') {
+          return SshConnectionState.NeedsCredential;
+        }
         if (state === SshConnectionState.AuthFailed) return SshConnectionState.AuthFailed;
         if (state === SshConnectionState.Failed) return SshConnectionState.Failed;
       }

@@ -5,7 +5,8 @@ import { pasteboard } from '@kit.BasicServicesKit';
 import { TerminalSession, SessionEvent, TerminalOutputSlice,
   TerminalOutputSnapshot } from '../model/TerminalSession';
 import { Theme } from '../common/Theme';
-import { normalizedSshTarget } from '../model/ManagedDevice';
+import { ManagedDevice, decodeDevices, normalizedSshTarget,
+  sshAuthenticationArguments } from '../model/ManagedDevice';
 import { SshCredentialStore } from '../model/SshCredentialStore';
 import { SshSecretValue } from '../model/RemoteSshState';
 
@@ -82,6 +83,7 @@ export struct TerminalView {
   @StorageProp('colorScheme') @Watch('onStyleChanged') colorScheme: string = 'default';
   @StorageProp('scrollback') @Watch('onScrollbackChanged') scrollback: number = 10000;
   @StorageProp('lineHeight') @Watch('onStyleChanged') lineHeight: number = 1.0;
+  @StorageProp('devicesEncoded') devicesEncoded: string = '';
   private controller: webview.WebviewController = new webview.WebviewController();
   private termBridge: TermBridge | null = null;
   private ctrlDown: boolean = false;
@@ -218,8 +220,16 @@ export struct TerminalView {
   }
 
   /** Build a real OpenSSH PTY command. Host input is validated when saved and quoted again here. */
+  private remoteDevice(): ManagedDevice {
+    const device = decodeDevices(this.devicesEncoded).find((item: ManagedDevice) =>
+      item.id === this.session.deviceId);
+    return device === undefined ?
+      new ManagedDevice(this.session.deviceId, this.session.deviceName, this.session.sshTarget) : device;
+  }
+
   private remoteStartCommand(): string {
     const target = normalizedSshTarget(this.session.sshTarget);
+    const device = this.remoteDevice();
     const changeDirectory = this.remoteChangeDirectory();
     // The local child is only `ssh`, so /proc/<child>/cwd cannot represent the
     // remote shell. A lightweight remote monitor follows the exec-stable shell
@@ -244,13 +254,11 @@ export struct TerminalView {
       sessionScript += 'clear; ' + interactiveShell;
     }
     const remoteScript = 'exec "${SHELL:-/bin/sh}" -lc ' + this.shellQuote(sessionScript);
-    return '/usr/bin/ssh -tt -o BatchMode=no -o ConnectTimeout=10 ' +
+    return '/usr/bin/ssh -tt -o ConnectTimeout=10 ' +
       '-o ServerAliveInterval=15 -o ServerAliveCountMax=3 ' +
       '-o StrictHostKeyChecking=accept-new -o ' +
       this.shellQuote('UserKnownHostsFile=' + this.session.sshKnownHostsPath) + ' ' +
-      '-o PasswordAuthentication=yes -o KbdInteractiveAuthentication=yes ' +
-      '-o PreferredAuthentications=publickey,password,keyboard-interactive ' +
-      '-o NumberOfPasswordPrompts=1 -- ' +
+      sshAuthenticationArguments(device) + ' -- ' +
       this.shellQuote(target) + ' ' + this.shellQuote(remoteScript);
   }
 
@@ -852,7 +860,8 @@ export struct TerminalView {
   private async createNativeSession(cols: number, rows: number, nativeCwd: string,
     nativeCommand: string): Promise<void> {
     const remote = this.session.sshTarget.length > 0;
-    const secret = new SshSecretValue(remote ? await SshCredentialStore.load(this.session.deviceId) : '');
+    const secret = new SshSecretValue(remote ?
+      await SshCredentialStore.loadForDevice(this.remoteDevice()) : '');
     let id = -1;
     if (this.session.disposed) {
       secret.value = '';

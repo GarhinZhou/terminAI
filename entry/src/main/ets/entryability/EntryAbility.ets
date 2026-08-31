@@ -1,35 +1,53 @@
 import { AbilityConstant, Configuration, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
-import { notificationManager } from '@kit.NotificationKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 
 const DOMAIN = 0x0000;
 
 export default class EntryAbility extends UIAbility {
+  private publishNotificationSelection(want: Want): void {
+    if (want.parameters === undefined) {
+      return;
+    }
+    const value = want.parameters['terminaiSessionUid'];
+    if (typeof value !== 'number' || value <= 0) {
+      return;
+    }
+    AppStorage.setOrCreate('notificationSessionRequest', value.toString() + ':' + Date.now().toString());
+  }
+
   private publishTitleButtonInset(rect: window.TitleButtonRect): void {
     const inset: number = rect.width + Math.max(rect.right, 0);
     AppStorage.setOrCreate('titleButtonInset', inset);
   }
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    AppStorage.setOrCreate('appForeground', false);
+    AppStorage.setOrCreate('notificationSessionRequest', '');
+    this.publishNotificationSelection(want);
     try {
       this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
     } catch (err) {
       hilog.error(DOMAIN, 'terminAI', 'setColorMode failed: %{public}s', JSON.stringify(err));
     }
     this.pushSysDark(this.context.config.colorMode);
-    // Best-effort: enable notifications (used for session-exit alerts).
-    // If the user declines, we silently degrade to in-app unread badges.
-    try {
-      notificationManager.requestEnableNotification(this.context).then(() => {
-        hilog.info(DOMAIN, 'terminAI', 'notification enabled');
-      }).catch(() => {
-        hilog.info(DOMAIN, 'terminAI', 'notification declined');
-      });
-    } catch (err) {
-      hilog.warn(DOMAIN, 'terminAI', 'requestEnableNotification unavailable');
-    }
+  }
+
+  onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    this.publishNotificationSelection(want);
+  }
+
+  onForeground(): void {
+    AppStorage.setOrCreate('appForeground', true);
+  }
+
+  onBackground(): void {
+    AppStorage.setOrCreate('appForeground', false);
+  }
+
+  onDestroy(): void {
+    AppStorage.setOrCreate('appForeground', false);
   }
 
   onConfigurationUpdate(newConfig: Configuration): void {

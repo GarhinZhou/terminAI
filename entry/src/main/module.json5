@@ -37,11 +37,6 @@
         "usedScene": { "abilities": ["EntryAbility"], "when": "inuse" }
       },
       {
-        "name": "ohos.permission.READ_PASTEBOARD",
-        "reason": "$string:perm_read_pasteboard",
-        "usedScene": { "abilities": ["EntryAbility"], "when": "inuse" }
-      },
-      {
         "name": "ohos.permission.CUSTOM_SANDBOX"
       }
     ],

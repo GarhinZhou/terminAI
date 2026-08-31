@@ -1,7 +1,7 @@
 // Main page: sidebar + terminal stack + Ctrl+K palette.
 import libterminal from 'libterminal.so';
 import { preferences } from '@kit.ArkData';
-import { canonicalSessionCwd, TerminalSession, SessionManager, SessionEvent,
+import { AgentRunState, canonicalSessionCwd, TerminalSession, SessionManager, SessionEvent,
   SessionProcessInfo } from '../model/TerminalSession';
 import { TerminalView } from '../view/TerminalView';
 import { SidebarView } from '../view/SidebarView';
@@ -9,7 +9,6 @@ import { SearchView } from '../view/SearchView';
 import { NewAgentDialog } from '../view/NewAgentDialog';
 import { NewSpaceDialog } from '../view/NewSpaceDialog';
 import { SettingsView } from '../view/SettingsView';
-import { notificationManager } from '@kit.NotificationKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { window } from '@kit.ArkUI';
@@ -18,14 +17,17 @@ import { BrandIcon } from '../common/BrandIcon';
 import { IconName, UiIcon } from '../common/Icons';
 import { SessionNumberBadge } from '../common/SessionNumberBadge';
 import { DeviceManagerDialog } from '../view/DeviceManagerDialog';
-import { ManagedDevice, decodeDevices, LOCAL_DEVICE_ID, localDevice, normalizedSshTarget } from '../model/ManagedDevice';
+import { ManagedDevice, decodeDevices, LOCAL_DEVICE_ID, localDevice, normalizedSshTarget,
+  sshAuthenticationArguments } from '../model/ManagedDevice';
 import { migrateAgentOverrides } from '../model/AgentOverrides';
 import { SshCredentialStore } from '../model/SshCredentialStore';
+import { SshIdentityStore } from '../model/SshIdentityStore';
 import { PendingRemoteSession, RemoteAgentInfo, SshConnectionState, SshRuntimeConnection,
   SshSecretValue, encodeConnectionStates, removeRemoteAgents,
   replaceRemoteAgents } from '../model/RemoteSshState';
 import { SavedSessionInfo, decodeSavedSessions,
   encodeSavedSessions } from '../model/SessionPersistence';
+import { SessionNotificationService } from '../model/SessionNotificationService';
 
 const SSH_CONNECTED_MARKER = '__TERMINAI_SSH_CONNECTED__';
 
@@ -111,7 +113,7 @@ struct Index {
   @StorageProp('scrollback') @Watch('onStyleChanged') scrollback: number = 10000;
   @StorageProp('programOrder') programOrder: string = '';
   @StorageProp('defaultProgram') defaultProgram: string = '';
-  @StorageProp('notifyEnabled') @Watch('onStyleChanged') notifyEnabled: boolean = true;
+  @StorageProp('notifyEnabled') @Watch('onNotifyEnabledChanged') notifyEnabled: boolean = false;
   @StorageProp('autoNewSession') @Watch('onStyleChanged') autoNewSession: boolean = true;
   @StorageProp('autoConnectSsh') autoConnectSsh: boolean = false;
   @StorageProp('lineHeight') @Watch('onStyleChanged') lineHeight: number = 1.0;
@@ -127,6 +129,9 @@ struct Index {
   @StorageProp('lastProgramsByDevice') @Watch('onStyleChanged') lastProgramsByDevice: string = '';
   @StorageProp('sysDark') @Watch('onThemeModeChanged') sysDark: boolean = true;
   @StorageProp('titleButtonInset') titleButtonInset: number = 0;
+  @StorageProp('appForeground') @Watch('onAppForegroundChanged') appForeground: boolean = true;
+  @StorageProp('notificationSessionRequest') @Watch('onNotificationSessionRequestChanged')
+  notificationSessionRequest: string = '';
   private ctrlDown: boolean = false;
   private shiftDown: boolean = false;
   /** Prevent @Watch callbacks from writing default values over preferences while they are loading. */
@@ -139,6 +144,7 @@ struct Index {
   private activityInspectionTimer: number = -1;
   private activityScanCursor: number = 0;
   private mgr: SessionManager = new SessionManager();
+  private notificationStates: Map<number, AgentRunState> = new Map();
   private sshConnections: SshRuntimeConnection[] = [];
   private mainWindow: window.Window | undefined = AppStorage.get<window.Window>('mainWindow');
   // Standard modal dialogs.
@@ -214,8 +220,8 @@ struct Index {
       getDeviceStatus: (id: string) => this.deviceStatus(id),
       onSelect: (id: string) => { this.selectDevice(id); },
       onDevicesChanged: (value: string) => { this.updateDevices(value); },
-      onDeviceSaved: (device: ManagedDevice, password: string, isNew: boolean) => {
-        return this.handleDeviceSaved(device, password, isNew);
+      onDeviceSaved: (device: ManagedDevice, credential: string, isNew: boolean) => {
+        return this.handleDeviceSaved(device, credential, isNew);
       },
       onDeviceRemoved: (device: ManagedDevice) => { this.handleDeviceRemoved(device); },
       onConnect: (device: ManagedDevice) => { this.connectAndOpenTerminal(device); }
@@ -240,6 +246,7 @@ struct Index {
     const session = this.currentIdx >= 0 && this.currentIdx < this.sessions.length ?
       this.sessions[this.currentIdx] : null;
     if (session === null) return;
+    SessionNotificationService.cancelSession(session.uid);
     this.touchRenderedSession(session.uid);
     // TerminalView requests focus after its ArkWeb is mounted, visible and
     // ready. Requesting it here races the renderer-pool update and can target
@@ -358,6 +365,7 @@ struct Index {
     if (!restoredSessions && this.autoNewSession) {
       this.newSession();
     }
+    this.routeNotificationSelection();
     // Auto-connect saved SSH hosts (best-effort, no password prompts).
     if (this.autoConnectSsh) {
       this.autoConnectSavedDevices();
@@ -704,18 +712,20 @@ struct Index {
     }
   }
 
-  private async handleDeviceSaved(device: ManagedDevice, password: string, isNew: boolean): Promise<boolean> {
-    if (password.length > 0) {
-      const saved = await SshCredentialStore.save(device.id, password);
+  private async handleDeviceSaved(device: ManagedDevice, credential: string,
+    isNew: boolean): Promise<boolean> {
+    const credentialKind = SshCredentialStore.kindForDevice(device);
+    if (credential.length > 0) {
+      const saved = await SshCredentialStore.save(device.id, credential, credentialKind);
       if (!saved) {
         try {
-          this.getUIContext().getPromptAction().showToast({ message: 'SSH 密码保存失败，请重试' });
+          this.getUIContext().getPromptAction().showToast({ message: 'SSH 登录凭据保存失败，请重试' });
         } catch (e) {
         }
         return false;
       }
     } else if (isNew) {
-      await SshCredentialStore.remove(device.id);
+      await SshCredentialStore.remove(device.id, credentialKind);
     }
     this.selectDevice(device.id);
     this.disconnectDevice(device.id);
@@ -725,7 +735,11 @@ struct Index {
 
   private handleDeviceRemoved(device: ManagedDevice): void {
     this.disconnectDevice(device.id, true);
-    SshCredentialStore.remove(device.id).catch(() => {});
+    SshCredentialStore.removeAll(device.id).catch(() => {});
+    const context = this.getUIContext().getHostContext();
+    if (context !== undefined) {
+      SshIdentityStore.removeManaged(context.filesDir, device.identityFile).catch(() => {});
+    }
     this.remoteAgentsEncoded = removeRemoteAgents(this.remoteAgentsEncoded, device.id);
     AppStorage.setOrCreate('remoteAgentsEncoded', this.remoteAgentsEncoded);
     this.saveRemoteAgents();
@@ -757,17 +771,15 @@ struct Index {
     this.newSession('', '', '', '', device, shellName);
   }
 
-  private buildMasterCommand(connection: SshRuntimeConnection): string {
+  private buildMasterCommand(connection: SshRuntimeConnection, device: ManagedDevice): string {
     const target = normalizedSshTarget(connection.target);
     const knownHosts = this.connectionFilePath(connection.deviceId, '-known-hosts');
     // HarmonyOS user/app data filesystems do not reliably support OpenSSH's
     // Unix-domain ControlPath socket. Keep one lightweight validation
     // connection, while terminals authenticate independently from Asset Store.
-    return '/usr/bin/ssh -N -o BatchMode=no -o ConnectTimeout=10 -o ServerAliveInterval=15 ' +
+    return '/usr/bin/ssh -N -o ConnectTimeout=10 -o ServerAliveInterval=15 ' +
       '-o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new ' +
-      '-o PasswordAuthentication=yes -o KbdInteractiveAuthentication=yes ' +
-      '-o PreferredAuthentications=publickey,password,keyboard-interactive ' +
-      '-o NumberOfPasswordPrompts=1 ' +
+      sshAuthenticationArguments(device) + ' ' +
       '-o PermitLocalCommand=yes -o ' + this.shellQuote('LocalCommand=printf ' + SSH_CONNECTED_MARKER) +
       ' -o ' + this.shellQuote('UserKnownHostsFile=' + knownHosts) +
       ' -- ' + this.shellQuote(target);
@@ -802,21 +814,21 @@ struct Index {
 
     connection.target = device.sshTarget;
     connection.controlPath = '';
-    connection.passwordSent = false;
+    connection.credentialAvailable = false;
     connection.connectedMarkerSeen = false;
     connection.authOutput = '';
     connection.scanOutput = '';
     this.setConnectionState(connection, SshConnectionState.Connecting);
 
-    const secret = new SshSecretValue(await SshCredentialStore.load(device.id));
+    const secret = new SshSecretValue(await SshCredentialStore.loadForDevice(device));
     if (connection.state !== SshConnectionState.Connecting) {
       secret.value = '';
       return;
     }
     try {
-      const command = this.buildMasterCommand(connection);
+      const command = this.buildMasterCommand(connection, device);
       const activeConnection: SshRuntimeConnection = connection;
-      connection.passwordSent = secret.value.length > 0;
+      connection.credentialAvailable = secret.value.length > 0;
       connection.masterId = libterminal.createSessionWithSecret(80, 24, '~', command, secret.value,
         (event: SessionEvent) => {
           this.handleMasterEvent(activeConnection, event);
@@ -848,12 +860,11 @@ struct Index {
         });
         return;
       }
-      if (lower.indexOf('password:') >= 0) {
-        // Stored passwords are injected by the native PTY reader before this
-        // asynchronous UI callback runs. No saved secret means user action is
-        // required instead of exposing a terminal password prompt.
-        if (!connection.passwordSent) {
-          this.failConnection(connection, SshConnectionState.NeedsPassword);
+      if (this.hasSshCredentialPrompt(lower)) {
+        // The native PTY reader injects a stored password or key passphrase
+        // before this asynchronous UI callback runs.
+        if (!connection.credentialAvailable) {
+          this.failConnection(connection, SshConnectionState.NeedsCredential);
         }
         return;
       }
@@ -896,7 +907,13 @@ struct Index {
     ];
   }
 
-  private buildRemoteScanCommand(connection: SshRuntimeConnection): string {
+  private hasSshCredentialPrompt(lowerOutput: string): boolean {
+    return lowerOutput.indexOf('password:') >= 0 ||
+      lowerOutput.indexOf('enter passphrase for key') >= 0 ||
+      lowerOutput.indexOf('passphrase:') >= 0;
+  }
+
+  private buildRemoteScanCommand(connection: SshRuntimeConnection, device: ManagedDevice): string {
     const names = this.remoteAgentCandidates().map((item: RemoteAgentCandidate) => item.name).join(' ');
     const scanScript = 'for terminai_name in ' + names + '; do ' +
       'terminai_path=$(command -v "$terminai_name" 2>/dev/null) || continue; ' +
@@ -913,12 +930,10 @@ struct Index {
       'printf "__TERMINAI_SHELL__\\t%s\\n" "$(basename "$terminai_shell")";';
     const remoteScript = 'exec "${SHELL:-/bin/sh}" -lc ' + this.shellQuote(scanScript);
     const knownHosts = this.connectionFilePath(connection.deviceId, '-known-hosts');
-    return '/usr/bin/ssh -T -o BatchMode=no -o ConnectTimeout=10 ' +
+    return '/usr/bin/ssh -T -o ConnectTimeout=10 ' +
       '-o StrictHostKeyChecking=accept-new -o ' +
       this.shellQuote('UserKnownHostsFile=' + knownHosts) + ' ' +
-      '-o PasswordAuthentication=yes -o KbdInteractiveAuthentication=yes ' +
-      '-o PreferredAuthentications=publickey,password,keyboard-interactive ' +
-      '-o NumberOfPasswordPrompts=1 -- ' +
+      sshAuthenticationArguments(device) + ' -- ' +
       this.shellQuote(normalizedSshTarget(connection.target)) + ' ' + this.shellQuote(remoteScript);
   }
 
@@ -928,13 +943,19 @@ struct Index {
     }
     connection.scanOutput = '';
     this.setConnectionState(connection, SshConnectionState.Scanning);
-    const secret = new SshSecretValue(await SshCredentialStore.load(connection.deviceId));
+    const device = decodeDevices(this.devicesEncoded).find((item: ManagedDevice) =>
+      item.id === connection.deviceId);
+    if (device === undefined) {
+      this.finishRemoteScan(connection, false);
+      return;
+    }
+    const secret = new SshSecretValue(await SshCredentialStore.loadForDevice(device));
     if (connection.state !== SshConnectionState.Scanning) {
       secret.value = '';
       return;
     }
     try {
-      const command = this.buildRemoteScanCommand(connection);
+      const command = this.buildRemoteScanCommand(connection, device);
       connection.scanId = libterminal.createSessionWithSecret(80, 24, '~', command, secret.value,
         (event: SessionEvent) => {
           this.handleRemoteScanEvent(connection, event);
@@ -1130,7 +1151,7 @@ struct Index {
       AppStorage.setOrCreate('scrollback', store.getSync(PREF_SCROLLBACK, 10000) as number);
       AppStorage.setOrCreate('programOrder', store.getSync(PREF_PROGRAM_ORDER, '') as string);
       AppStorage.setOrCreate('defaultProgram', store.getSync(PREF_DEFAULT_PROGRAM, '') as string);
-      AppStorage.setOrCreate('notifyEnabled', store.getSync(PREF_NOTIFY_ENABLED, true) as boolean);
+      AppStorage.setOrCreate('notifyEnabled', store.getSync(PREF_NOTIFY_ENABLED, false) as boolean);
       AppStorage.setOrCreate('autoNewSession', store.getSync(PREF_AUTO_NEW_SESSION, true) as boolean);
       AppStorage.setOrCreate('autoConnectSsh', store.getSync(PREF_AUTO_CONNECT_SSH, false) as boolean);
       AppStorage.setOrCreate('lineHeight', store.getSync(PREF_LINE_HEIGHT, 1.0) as number);
@@ -1229,6 +1250,46 @@ struct Index {
     this.scheduleStylePrefsSave();
   }
 
+  onNotifyEnabledChanged(): void {
+    this.onStyleChanged();
+    if (!this.notifyEnabled) {
+      SessionNotificationService.cancelAll();
+    }
+  }
+
+  onAppForegroundChanged(): void {
+    if (!this.appForeground) {
+      return;
+    }
+    const current = this.currentSession();
+    if (current !== null) {
+      SessionNotificationService.cancelSession(current.uid);
+    }
+  }
+
+  onNotificationSessionRequestChanged(): void {
+    this.routeNotificationSelection();
+  }
+
+  private routeNotificationSelection(): void {
+    const separator = this.notificationSessionRequest.indexOf(':');
+    const uidText = separator >= 0 ?
+      this.notificationSessionRequest.substring(0, separator) : this.notificationSessionRequest;
+    const uid = Number.parseInt(uidText);
+    if (!Number.isFinite(uid) || uid <= 0) {
+      return;
+    }
+    const index = this.sessions.findIndex((session: TerminalSession) => session.uid === uid);
+    if (index >= 0) {
+      const target = this.sessions[index];
+      if (this.selectedDeviceId.length > 0 && this.selectedDeviceId !== target.deviceId) {
+        this.selectDevice(target.deviceId);
+      }
+      this.currentIdx = index;
+      SessionNotificationService.cancelSession(uid);
+    }
+  }
+
   private scheduleStylePrefsSave(): void {
     if (this.loadingStylePrefs) {
       return;
@@ -1264,23 +1325,29 @@ struct Index {
     }
   }
 
-  private notifyExit(s: TerminalSession): void {
-    if (!this.notifyEnabled) {
+  private handleSessionNotificationState(s: TerminalSession): void {
+    const previous = this.notificationStates.get(s.uid) ?? AgentRunState.Unknown;
+    const current = s.alive ? s.activityState : AgentRunState.Exited;
+    this.notificationStates.set(s.uid, current);
+    if (previous === current) {
       return;
     }
-    try {
-      const req: notificationManager.NotificationRequest = {
-        id: s.id,
-        content: {
-          notificationContentType: notificationManager.ContentType.NOTIFICATION_CONTENT_BASIC_TEXT,
-          normal: {
-            title: 'terminAI 会话已退出',
-            text: s.displayName() + '（退出码 ' + s.exitCode + '）'
-          }
-        }
-      };
-      notificationManager.publish(req).catch(() => {});
-    } catch (e) {}
+    if (SessionNotificationService.isAttentionState(current)) {
+      const index = this.sessions.indexOf(s);
+      const userIsLooking = this.appForeground && index === this.currentIdx;
+      if (this.notifyEnabled && !userIsLooking) {
+        SessionNotificationService.publishSession(s, current)
+          .catch((error: BusinessError) => {
+            hilog.warn(DOMAIN, 'terminAI', 'publish session notification failed: %{public}s',
+              JSON.stringify(error));
+          });
+      }
+      return;
+    }
+    // Output resumed, so an old "waiting for input" notification is stale.
+    if (current === AgentRunState.Outputting || current === AgentRunState.Silent) {
+      SessionNotificationService.cancelSession(s.uid);
+    }
   }
 
   private newSession(startCwd: string = '', cmd: string = '', label: string = '',
@@ -1323,15 +1390,9 @@ struct Index {
       s.manualTitle = restoredManualTitle;
     }
     s.onNativeEvent = (event: SessionEvent) => { this.mgr.dispatch(event); };
+    this.notificationStates.set(s.uid, s.activityState);
     s.onStateChanged = () => {
-      if (!s.alive) {
-        // session exited: notify only if user isn't looking at it
-        const idx = this.sessions.indexOf(s);
-        if (idx !== this.currentIdx && !s.exitNotificationSent) {
-          this.notifyExit(s);
-          s.exitNotificationSent = true;
-        }
-      }
+      this.handleSessionNotificationState(s);
       // Keep exited sessions visible until the user closes them so the
       // "会话已退出" state remains truthful and recoverable.
       this.sessions = [...this.sessions];
@@ -1356,6 +1417,8 @@ struct Index {
     const selected = this.currentSession();
     const selectedUid = selected === null ? -1 : selected.uid;
     this.mgr.remove(s);
+    this.notificationStates.delete(s.uid);
+    SessionNotificationService.cancelSession(s.uid);
     this.sessions = [...this.mgr.sessions];
     this.renderedSessionUids = this.renderedSessionUids.filter((uid: number) => uid !== s.uid);
     if (this.sessions.length === 0) {

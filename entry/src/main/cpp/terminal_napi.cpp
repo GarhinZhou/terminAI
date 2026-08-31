@@ -117,8 +117,8 @@ struct PtySession {
     size_t pendingWriteBytes = 0;
     std::string cwd;   // last known working directory
     std::string startCwd;
-    // Used only by the hidden SSH master session. It is never placed in a
-    // command line or environment variable and is erased after first use.
+    // SSH password or private-key passphrase. It is never placed in a command
+    // line/environment variable and is erased immediately after first use.
     std::string authSecret;
     std::string authTail;
     bool authSecretSent = false;
@@ -352,7 +352,7 @@ void ClearPendingWrites(PtySession* s) {
     s->pendingWriteBytes = 0;
 }
 
-void HandleStoredSshPassword(PtySession* s, const std::string& output) {
+void HandleStoredSshCredential(PtySession* s, const std::string& output) {
     if (s->authSecret.empty()) return;
     s->authTail += output;
     if (s->authTail.size() > 1024) {
@@ -364,14 +364,17 @@ void HandleStoredSshPassword(PtySession* s, const std::string& output) {
         return;
     }
     const std::string lower = LowerAscii(s->authTail);
-    if (s->authSecretSent || lower.find("password:") == std::string::npos) return;
+    const bool passwordPrompt = lower.find("password:") != std::string::npos;
+    const bool keyPassphrasePrompt = lower.find("enter passphrase for key") != std::string::npos ||
+        lower.find("passphrase:") != std::string::npos;
+    if (s->authSecretSent || (!passwordPrompt && !keyPassphrasePrompt)) return;
 
     std::string input = s->authSecret + "\n";
     const bool written = EnqueueSessionWrite(s, std::move(input), true);
     s->authSecretSent = true;
     SecureErase(s->authSecret);
     s->authTail.clear();
-    LOGI("session %{public}d handled stored SSH password written=%{public}d", s->id, written ? 1 : 0);
+    LOGI("session %{public}d handled stored SSH credential written=%{public}d", s->id, written ? 1 : 0);
 }
 
 // ── Reader / waiter threads ─────────────────────────────────────────
@@ -422,7 +425,7 @@ void* ReaderMain(void* arg) {
                 if (n > 0) {
                     burstBytes += static_cast<size_t>(n);
                     const std::string rawOutput(buf, n);
-                    HandleStoredSshPassword(s, rawOutput);
+                    HandleStoredSshCredential(s, rawOutput);
                     const std::string output = SanitizeUtf8Chunk(
                         buf, static_cast<size_t>(n), utf8Tail, false);
                     if (!output.empty()) {
@@ -1393,6 +1396,28 @@ napi_value ListDirs(napi_env env, napi_callback_info info) {
     return arr;
 }
 
+// OpenSSH refuses private keys that are readable by other users. Picker files
+// are copied into the app sandbox first, then restricted to owner read/write.
+napi_value SecurePrivateFile(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value args[1] = {};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+
+    std::string path;
+    if (argc < 1 || !ReadUtf8String(env, args[0], 4095, path) || path.empty() || path[0] != '/') {
+        napi_value result;
+        napi_get_boolean(env, false, &result);
+        return result;
+    }
+
+    struct stat st {};
+    const bool secured = lstat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode) &&
+        chmod(path.c_str(), S_IRUSR | S_IWUSR) == 0;
+    napi_value result;
+    napi_get_boolean(env, secured, &result);
+    return result;
+}
+
 napi_value Init(napi_env env, napi_value exports) {
     napi_property_descriptor desc[] = {
         { "createSession", nullptr, CreateSession, nullptr, nullptr, nullptr, napi_default, nullptr },
@@ -1406,6 +1431,7 @@ napi_value Init(napi_env env, napi_value exports) {
         { "inspectSessionAsync", nullptr, InspectSessionAsync, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "listPrograms", nullptr, ListPrograms, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "listDirs", nullptr, ListDirs, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "securePrivateFile", nullptr, SecurePrivateFile, nullptr, nullptr, nullptr, napi_default, nullptr },
     };
     napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);
     return exports;

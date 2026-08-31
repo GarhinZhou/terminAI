@@ -1,9 +1,11 @@
+import { picker } from '@kit.CoreFileKit';
 import { Theme } from '../common/Theme';
 import { IconName, UiIcon } from '../common/Icons';
-import { ManagedDevice, decodeDevices, encodeDevices, isValidSshTarget,
-  localDevice, newDeviceId } from '../model/ManagedDevice';
+import { ManagedDevice, SshAuthMode, decodeDevices, encodeDevices, isValidIdentityFile,
+  isValidSshTarget, localDevice, newDeviceId } from '../model/ManagedDevice';
 import { SshConnectionState, connectionStateOf } from '../model/RemoteSshState';
-import { SshCredentialStore } from '../model/SshCredentialStore';
+import { SshCredentialKind, SshCredentialStore } from '../model/SshCredentialStore';
+import { SshIdentityStore } from '../model/SshIdentityStore';
 
 @CustomDialog
 export struct DeviceManagerDialog {
@@ -11,7 +13,7 @@ export struct DeviceManagerDialog {
   getDeviceStatus: (id: string) => string = () => '未连接';
   onSelect: (id: string) => void = () => {};
   onDevicesChanged: (value: string) => void = () => {};
-  onDeviceSaved: (device: ManagedDevice, password: string, isNew: boolean) => Promise<boolean> =
+  onDeviceSaved: (device: ManagedDevice, credential: string, isNew: boolean) => Promise<boolean> =
     async () => false;
   onDeviceRemoved: (device: ManagedDevice) => void = () => {};
   onConnect: (device: ManagedDevice) => void = () => {};
@@ -25,17 +27,26 @@ export struct DeviceManagerDialog {
   @State private editingId: string = '';
   @State private name: string = '';
   @State private target: string = '';
-  @State private password: string = '';
+  @State private authMode: SshAuthMode = SshAuthMode.Password;
+  @State private identityFile: string = '';
+  @State private credential: string = '';
   @State private formVisible: boolean = false;
   @State private errorText: string = '';
   @State private hoveredKey: string = '';
-  @State private storedPassword: boolean = false;
-  @State private storedPasswordLength: number = 0;
-  @State private checkingPassword: boolean = false;
+  @State private storedCredential: boolean = false;
+  @State private storedCredentialLength: number = 0;
+  @State private checkingCredential: boolean = false;
   @State private saving: boolean = false;
+  @State private pickingIdentity: boolean = false;
+  private originalIdentityFile: string = '';
+  private pendingImportedIdentity: string = '';
 
   aboutToAppear(): void {
     this.devices = decodeDevices(this.devicesEncoded);
+  }
+
+  aboutToDisappear(): void {
+    this.discardPendingIdentity();
   }
 
   private accentOf(): string {
@@ -79,50 +90,101 @@ export struct DeviceManagerDialog {
     if (state === SshConnectionState.Connecting || state === SshConnectionState.Scanning) {
       return this.accentOf();
     }
-    if (state === SshConnectionState.AuthFailed || state === SshConnectionState.NeedsPassword ||
+    if (state === SshConnectionState.AuthFailed || state === SshConnectionState.NeedsCredential ||
       state === SshConnectionState.Failed) {
       return Theme.danger(this.isDark);
     }
     return Theme.tertiary(this.isDark);
   }
 
+  private authModeLabel(device: ManagedDevice): string {
+    return device.authMode === SshAuthMode.PrivateKey ? '私钥' : '密码 / 默认密钥';
+  }
+
+  private appFilesDir(): string {
+    const context = this.getUIContext().getHostContext();
+    return context === undefined ? '' : context.filesDir;
+  }
+
+  private identityManagedByApp(): boolean {
+    return SshIdentityStore.isManaged(this.appFilesDir(), this.identityFile.trim());
+  }
+
+  private discardPendingIdentity(): void {
+    const pending = this.pendingImportedIdentity;
+    this.pendingImportedIdentity = '';
+    if (pending.length > 0) {
+      SshIdentityStore.removeManaged(this.appFilesDir(), pending).catch(() => {});
+    }
+  }
+
   private beginAdd(): void {
+    this.discardPendingIdentity();
     this.editingId = '';
     this.name = '';
     this.target = '';
-    this.password = '';
-    this.storedPassword = false;
-    this.storedPasswordLength = 0;
-    this.checkingPassword = false;
+    this.authMode = SshAuthMode.Password;
+    this.identityFile = '';
+    this.originalIdentityFile = '';
+    this.credential = '';
+    this.storedCredential = false;
+    this.storedCredentialLength = 0;
+    this.checkingCredential = false;
     this.saving = false;
+    this.pickingIdentity = false;
     this.errorText = '';
     this.formVisible = true;
   }
 
   private beginEdit(device: ManagedDevice): void {
+    this.discardPendingIdentity();
     this.editingId = device.id;
     this.name = device.name;
     this.target = device.sshTarget;
-    this.password = '';
-    this.storedPassword = false;
-    this.storedPasswordLength = 0;
-    this.checkingPassword = true;
+    this.authMode = device.authMode;
+    this.identityFile = device.identityFile;
+    this.originalIdentityFile = device.identityFile;
+    this.credential = '';
+    this.storedCredential = false;
+    this.storedCredentialLength = 0;
+    this.checkingCredential = true;
     this.saving = false;
+    this.pickingIdentity = false;
     this.errorText = '';
     this.formVisible = true;
-    this.refreshStoredPassword(device.id);
+    this.refreshStoredCredential(device.id, device.authMode);
   }
 
-  private async refreshStoredPassword(deviceId: string): Promise<void> {
-    const length = await SshCredentialStore.passwordLength(deviceId);
-    if (this.editingId === deviceId && this.formVisible) {
-      this.storedPasswordLength = length;
-      this.storedPassword = length > 0;
-      this.checkingPassword = false;
+  private credentialKind(mode: SshAuthMode): SshCredentialKind {
+    return mode === SshAuthMode.PrivateKey ?
+      SshCredentialKind.KeyPassphrase : SshCredentialKind.Password;
+  }
+
+  private async refreshStoredCredential(deviceId: string, mode: SshAuthMode): Promise<void> {
+    const length = await SshCredentialStore.secretLength(deviceId, this.credentialKind(mode));
+    if (this.editingId === deviceId && this.formVisible && this.authMode === mode) {
+      this.storedCredentialLength = length;
+      this.storedCredential = length > 0;
+      this.checkingCredential = false;
     }
   }
 
-  private passwordCharacterCount(value: string): number {
+  private selectAuthMode(mode: SshAuthMode): void {
+    if (this.authMode === mode || this.saving) {
+      return;
+    }
+    this.authMode = mode;
+    this.credential = '';
+    this.storedCredential = false;
+    this.storedCredentialLength = 0;
+    this.checkingCredential = this.editingId.length > 0;
+    this.errorText = '';
+    if (this.editingId.length > 0) {
+      this.refreshStoredCredential(this.editingId, mode);
+    }
+  }
+
+  private credentialCharacterCount(value: string): number {
     let count = 0;
     for (const character of value) {
       if (character.length > 0) {
@@ -132,12 +194,61 @@ export struct DeviceManagerDialog {
     return count;
   }
 
-  private storedPasswordPlaceholder(): string {
+  private storedCredentialPlaceholder(): string {
     let bullets = '';
-    for (let index = 0; index < this.storedPasswordLength; index++) {
+    for (let index = 0; index < this.storedCredentialLength; index++) {
       bullets += '•';
     }
     return bullets + '（已保存）';
+  }
+
+  private async pickIdentityFile(): Promise<void> {
+    if (this.pickingIdentity || this.saving) {
+      return;
+    }
+    const context = this.getUIContext().getHostContext();
+    if (context === undefined) {
+      this.errorText = '无法打开系统文件选择器';
+      return;
+    }
+    this.pickingIdentity = true;
+    let uris: string[] = [];
+    try {
+      const options = new picker.DocumentSelectOptions();
+      options.selectMode = picker.DocumentSelectMode.FILE;
+      options.maxSelectNumber = 1;
+      const documentPicker = new picker.DocumentViewPicker(context);
+      uris = await documentPicker.select(options);
+    } catch (e) {
+      // Closing the system Picker is a normal cancel path.
+      console.info('TERMINAI SSH identity picker closed');
+      this.pickingIdentity = false;
+      return;
+    }
+    if (uris.length === 0) {
+      this.pickingIdentity = false;
+      return;
+    }
+
+    try {
+      const imported = await SshIdentityStore.importFromPickerUri(context.filesDir, uris[0]);
+      const previousPending = this.pendingImportedIdentity;
+      this.pendingImportedIdentity = imported;
+      this.identityFile = imported;
+      this.errorText = '';
+      if (previousPending.length > 0 && previousPending !== imported) {
+        SshIdentityStore.removeManaged(context.filesDir, previousPending).catch(() => {});
+      }
+    } catch (e) {
+      this.errorText = e instanceof Error ? e.message : '私钥文件导入失败，请重新选择';
+      console.error('TERMINAI SSH identity import failed');
+    }
+    this.pickingIdentity = false;
+  }
+
+  private cancelEditor(): void {
+    this.discardPendingIdentity();
+    this.formVisible = false;
   }
 
   private async saveDevice(): Promise<void> {
@@ -149,9 +260,14 @@ export struct DeviceManagerDialog {
       this.errorText = '请输入有效的 SSH 目标，例如 user@host 或 user@host:2222';
       return;
     }
-    if (this.password.indexOf('\n') >= 0 || this.password.indexOf('\r') >= 0 ||
-      this.password.length > 1024) {
-      this.errorText = '密码不能包含换行，且长度不能超过 1024 个字符';
+    if (this.authMode === SshAuthMode.PrivateKey && !isValidIdentityFile(this.identityFile)) {
+      this.errorText = '请输入私钥文件路径，例如 ~/.ssh/id_ed25519';
+      return;
+    }
+    if (this.credential.indexOf('\n') >= 0 || this.credential.indexOf('\r') >= 0 ||
+      this.credential.length > 1024) {
+      this.errorText = (this.authMode === SshAuthMode.PrivateKey ? '私钥口令' : '密码') +
+        '不能包含换行，且长度不能超过 1024 个字符';
       return;
     }
     const name = this.name.trim().length > 0 ? this.name.trim() : target;
@@ -163,10 +279,12 @@ export struct DeviceManagerDialog {
         this.errorText = '设备不存在，请重新添加';
         return;
       }
-      savedDevice = new ManagedDevice(this.editingId, name, target);
+      const identityPath = this.authMode === SshAuthMode.PrivateKey ? this.identityFile.trim() : '';
+      savedDevice = new ManagedDevice(this.editingId, name, target, this.authMode, identityPath);
       this.devices[index] = savedDevice;
     } else {
-      savedDevice = new ManagedDevice(newDeviceId(), name, target);
+      const identityPath = this.authMode === SshAuthMode.PrivateKey ? this.identityFile.trim() : '';
+      savedDevice = new ManagedDevice(newDeviceId(), name, target, this.authMode, identityPath);
       this.devices.push(savedDevice);
       // If credential persistence fails, a retry edits this same device rather
       // than appending a duplicate row.
@@ -176,17 +294,28 @@ export struct DeviceManagerDialog {
     this.devices = [...this.devices];
     this.devicesEncoded = encodeDevices(this.devices);
     this.onDevicesChanged(this.devicesEncoded);
-    const completed = await this.onDeviceSaved(savedDevice, this.password, isNew);
+    const completed = await this.onDeviceSaved(savedDevice, this.credential, isNew);
     if (!completed) {
       this.saving = false;
-      this.errorText = '登录密码未能保存，请重试';
+      this.errorText = 'SSH 登录凭据未能保存，请重试';
       return;
     }
-    if (this.password.length > 0) {
-      this.storedPassword = true;
-      this.storedPasswordLength = this.passwordCharacterCount(this.password);
+    if (this.credential.length > 0) {
+      this.storedCredential = true;
+      this.storedCredentialLength = this.credentialCharacterCount(this.credential);
     }
-    this.password = '';
+    const filesDir = this.appFilesDir();
+    const committedIdentity = savedDevice.identityFile;
+    const pendingIdentity = this.pendingImportedIdentity;
+    this.pendingImportedIdentity = '';
+    if (pendingIdentity.length > 0 && pendingIdentity !== committedIdentity) {
+      SshIdentityStore.removeManaged(filesDir, pendingIdentity).catch(() => {});
+    }
+    if (this.originalIdentityFile.length > 0 && this.originalIdentityFile !== committedIdentity) {
+      SshIdentityStore.removeManaged(filesDir, this.originalIdentityFile).catch(() => {});
+    }
+    this.originalIdentityFile = committedIdentity;
+    this.credential = '';
     this.saving = false;
     this.formVisible = false;
   }
@@ -236,7 +365,8 @@ export struct DeviceManagerDialog {
             .margin({ left: 7 })
         }
         .width('100%')
-        Text(device.isLocal() ? '当前 HarmonyOS 设备' : device.sshTarget + ' · SSH')
+        Text(device.isLocal() ? '当前 HarmonyOS 设备' :
+          device.sshTarget + ' · SSH · ' + this.authModeLabel(device))
           .fontSize(11.5)
           .fontColor(Theme.tertiary(this.isDark))
           .maxLines(1)
@@ -335,6 +465,20 @@ export struct DeviceManagerDialog {
   }
 
   @Builder
+  authModeButton(mode: SshAuthMode, label: string) {
+    Button(label)
+      .fontSize(12.5)
+      .height(30)
+      .layoutWeight(1)
+      .fontColor(this.authMode === mode ? this.accentOf() : Theme.subText(this.isDark))
+      .backgroundColor(this.authMode === mode ? Theme.accentWash(this.isDark) : Theme.input(this.isDark))
+      .borderRadius(7)
+      .enabled(!this.saving)
+      .onClick(() => { this.selectAuthMode(mode); })
+      .accessibilitySelected(this.authMode === mode)
+  }
+
+  @Builder
   editor() {
     Column() {
       Text(this.editingId.length > 0 ? '编辑 SSH 设备' : '添加 SSH 设备')
@@ -362,10 +506,46 @@ export struct DeviceManagerDialog {
         .enabled(!this.saving)
         .margin({ top: 7 })
         .onChange((value: string) => { this.target = value; this.errorText = ''; })
+
+      Row({ space: 7 }) {
+        this.authModeButton(SshAuthMode.Password, '密码 / 默认密钥')
+        this.authModeButton(SshAuthMode.PrivateKey, '指定私钥')
+      }
+      .width('100%')
+      .margin({ top: 7 })
+
+      if (this.authMode === SshAuthMode.PrivateKey) {
+        Row({ space: 7 }) {
+          TextInput({ placeholder: '私钥路径，例如 ~/.ssh/id_ed25519', text: this.identityFile })
+            .fontSize(14)
+            .height(38)
+            .layoutWeight(1)
+            .backgroundColor(Theme.input(this.isDark))
+            .fontColor(Theme.text(this.isDark))
+            .caretColor(this.accentOf())
+            .borderRadius(7)
+            .enabled(!this.saving && !this.pickingIdentity)
+            .onChange((value: string) => { this.identityFile = value; this.errorText = ''; })
+          Button(this.pickingIdentity ? '导入中…' : '选择文件')
+            .fontSize(12.5)
+            .height(38)
+            .width(86)
+            .fontColor(this.accentOf())
+            .backgroundColor(Theme.accentWash(this.isDark))
+            .borderRadius(7)
+            .enabled(!this.saving && !this.pickingIdentity)
+            .onClick(() => { this.pickIdentityFile(); })
+            .accessibilityText('使用系统文件选择器选择 SSH 私钥')
+        }
+        .width('100%')
+        .margin({ top: 7 })
+      }
+
       TextInput({
-        placeholder: this.storedPassword ? this.storedPasswordPlaceholder() :
-          (this.editingId.length > 0 ? '密码（留空则不修改）' : '密码（密钥认证可留空）'),
-        text: this.password
+        placeholder: this.storedCredential ? this.storedCredentialPlaceholder() :
+          (this.authMode === SshAuthMode.PrivateKey ? '私钥口令（无口令可留空）' :
+            (this.editingId.length > 0 ? '密码（留空则不修改）' : '密码（默认密钥可用时可留空）')),
+        text: this.credential
       })
         .type(InputType.Password)
         .fontSize(14)
@@ -376,16 +556,23 @@ export struct DeviceManagerDialog {
         .borderRadius(7)
         .enabled(!this.saving)
         .margin({ top: 7 })
-        .onChange((value: string) => { this.password = value; this.errorText = ''; })
+        .onChange((value: string) => { this.credential = value; this.errorText = ''; })
         .onSubmit(() => { this.saveDevice(); })
-      Text(this.checkingPassword ? '正在检查已保存的登录密码…' :
-        (this.storedPassword ? '已保存登录密码，留空不会修改。' :
-          '密码由系统关键资产服务加密保存在本机，仅用于此 SSH 设备。'))
+      Text(this.checkingCredential ? '正在检查已保存的 SSH 凭据…' :
+        (this.storedCredential ?
+          (this.authMode === SshAuthMode.PrivateKey ? '已保存私钥口令，留空不会修改。' :
+            '已保存登录密码，留空不会修改。') :
+          (this.authMode === SshAuthMode.PrivateKey ?
+            (this.identityManagedByApp() ?
+              '私钥副本已保存在应用沙箱并限制访问权限；删除设备时会同步清理。' :
+              '可手动填写路径，或通过系统选择器将私钥安全导入应用沙箱。请先将公钥加入远端 authorized_keys。') :
+            '密码由系统关键资产服务加密保存在本机；也兼容 SSH 配置、默认密钥和 SSH Agent。')))
         .fontSize(10.5)
-        .fontColor(this.storedPassword ? Theme.success(this.isDark) : Theme.tertiary(this.isDark))
+        .fontColor(this.storedCredential ? Theme.success(this.isDark) : Theme.tertiary(this.isDark))
         .width('100%')
         .margin({ top: 5 })
-        .accessibilityText(this.storedPassword ? '已保存登录密码，留空不会修改' : '尚未保存登录密码')
+        .accessibilityText(this.storedCredential ? '已保存 SSH 登录凭据，留空不会修改' :
+          '尚未保存 SSH 登录凭据')
       if (this.errorText.length > 0) {
         Text(this.errorText)
           .fontSize(11.5)
@@ -402,7 +589,7 @@ export struct DeviceManagerDialog {
           .fontColor(Theme.text(this.isDark))
           .borderRadius(7)
           .enabled(!this.saving)
-          .onClick(() => { this.formVisible = false; })
+          .onClick(() => { this.cancelEditor(); })
         Button(this.saving ? '保存中…' : (this.editingId.length > 0 ? '保存' : '添加'))
           .fontSize(13)
           .height(30)
@@ -459,7 +646,7 @@ export struct DeviceManagerDialog {
         }, (device: ManagedDevice) => device.id)
       }
       .width('100%')
-      .constraintSize({ maxHeight: 310 })
+      .constraintSize({ maxHeight: this.formVisible ? 190 : 310 })
       .padding({ left: 10, right: 10, top: 8, bottom: 8 })
       .scrollBar(BarState.Auto)
 

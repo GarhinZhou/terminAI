@@ -1,13 +1,23 @@
 /** Local or SSH host shown in the herdrm-style device switcher. */
+export enum SshAuthMode {
+  Password = 'password',
+  PrivateKey = 'privateKey'
+}
+
 export class ManagedDevice {
   id: string = '';
   name: string = '';
   sshTarget: string = '';
+  authMode: SshAuthMode = SshAuthMode.Password;
+  identityFile: string = '';
 
-  constructor(id: string, name: string, sshTarget: string) {
+  constructor(id: string, name: string, sshTarget: string,
+    authMode: SshAuthMode = SshAuthMode.Password, identityFile: string = '') {
     this.id = id;
     this.name = name;
     this.sshTarget = sshTarget;
+    this.authMode = authMode;
+    this.identityFile = identityFile;
   }
 
   isLocal(): boolean {
@@ -29,7 +39,8 @@ export function encodeDevices(items: ManagedDevice[]): string {
       continue;
     }
     records.push(encodeURIComponent(item.id) + '\t' + encodeURIComponent(item.name) + '\t' +
-      encodeURIComponent(item.sshTarget));
+      encodeURIComponent(item.sshTarget) + '\t' + encodeURIComponent(item.authMode) + '\t' +
+      encodeURIComponent(item.identityFile));
   }
   return records.join('\n');
 }
@@ -41,15 +52,19 @@ export function decodeDevices(value: string): ManagedDevice[] {
   }
   for (const record of value.split('\n')) {
     const fields = record.split('\t');
-    if (fields.length !== 3) {
+    // Three-field records are from releases before device-level key auth.
+    if (fields.length !== 3 && fields.length !== 5) {
       continue;
     }
     try {
       const id = decodeURIComponent(fields[0]).trim();
       const name = decodeURIComponent(fields[1]).trim();
       const target = decodeURIComponent(fields[2]).trim();
+      const authMode = fields.length === 5 && decodeURIComponent(fields[3]) === SshAuthMode.PrivateKey ?
+        SshAuthMode.PrivateKey : SshAuthMode.Password;
+      const identityFile = fields.length === 5 ? decodeURIComponent(fields[4]).trim() : '';
       if (id.length > 0 && name.length > 0 && isValidSshTarget(target)) {
-        devices.push(new ManagedDevice(id, name, target));
+        devices.push(new ManagedDevice(id, name, target, authMode, identityFile));
       }
     } catch (e) {
       console.error('TERMINAI device record decode failed: ' + JSON.stringify(e));
@@ -65,6 +80,33 @@ export function isValidSshTarget(value: string): boolean {
   }
   // OpenSSH alias, host, user@host, ssh:// URI, IPv4/IPv6 and custom port.
   return /^[A-Za-z0-9._@:\/\-+%\[\]]+$/.test(target);
+}
+
+/** Identity paths are shell-quoted at command construction time. */
+export function isValidIdentityFile(value: string): boolean {
+  const path = value.trim();
+  return path.length > 0 && path.length <= 4096 && path.indexOf('\n') < 0 &&
+    path.indexOf('\r') < 0 && path.indexOf('\0') < 0;
+}
+
+function shellQuote(value: string): string {
+  return "'" + value.replace(/'/g, "'\"'\"'") + "'";
+}
+
+/** Shared by validation, remote scan and visible terminal sessions. */
+export function sshAuthenticationArguments(device: ManagedDevice): string {
+  if (device.authMode === SshAuthMode.PrivateKey) {
+    return '-o BatchMode=no -o PubkeyAuthentication=yes ' +
+      '-o PasswordAuthentication=no -o KbdInteractiveAuthentication=no ' +
+      '-o PreferredAuthentications=publickey -o IdentitiesOnly=yes ' +
+      '-o NumberOfPasswordPrompts=0 -i ' + shellQuote(device.identityFile.trim());
+  }
+  // Keep publickey first for compatibility with SSH aliases, default keys and
+  // SSH Agent, then fall back to the password saved for this device.
+  return '-o BatchMode=no -o PubkeyAuthentication=yes ' +
+    '-o PasswordAuthentication=yes -o KbdInteractiveAuthentication=yes ' +
+    '-o PreferredAuthentications=publickey,password,keyboard-interactive ' +
+    '-o NumberOfPasswordPrompts=1';
 }
 
 export function newDeviceId(): string {
