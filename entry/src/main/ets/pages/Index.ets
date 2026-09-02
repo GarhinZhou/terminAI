@@ -1,8 +1,6 @@
 // Main page: sidebar + terminal stack + Ctrl+K palette.
 import libterminal from 'libterminal.so';
-import { preferences } from '@kit.ArkData';
-import { AgentRunState, canonicalSessionCwd, TerminalSession, SessionManager, SessionEvent,
-  SessionProcessInfo } from '../model/TerminalSession';
+import { canonicalSessionCwd, TerminalSession, SessionManager, SessionEvent } from '../model/TerminalSession';
 import { TerminalView } from '../view/TerminalView';
 import { SidebarView } from '../view/SidebarView';
 import { SearchView } from '../view/SearchView';
@@ -12,6 +10,7 @@ import { SettingsView } from '../view/SettingsView';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { window } from '@kit.ArkUI';
+import { pointer } from '@kit.InputKit';
 import { Theme } from '../common/Theme';
 import { BrandIcon } from '../common/BrandIcon';
 import { IconName, UiIcon } from '../common/Icons';
@@ -25,9 +24,11 @@ import { SshIdentityStore } from '../model/SshIdentityStore';
 import { PendingRemoteSession, RemoteAgentInfo, SshConnectionState, SshRuntimeConnection,
   SshSecretValue, encodeConnectionStates, removeRemoteAgents,
   replaceRemoteAgents } from '../model/RemoteSshState';
-import { SavedSessionInfo, decodeSavedSessions,
-  encodeSavedSessions } from '../model/SessionPersistence';
+import { decodeSavedSessions } from '../model/SessionPersistence';
 import { SessionNotificationService } from '../model/SessionNotificationService';
+import { BackgroundSessionService } from '../model/BackgroundSessionService';
+import { ResidentSessionBackend } from '../model/ResidentSessionBackend';
+import { TerminaiPreferences } from '../model/TerminaiPreferences';
 
 const SSH_CONNECTED_MARKER = '__TERMINAI_SSH_CONNECTED__';
 
@@ -51,9 +52,11 @@ const KEYCODE_K = 2027;
 const KEYCODE_T = 2036;
 const KEYCODE_W = 2039;
 const KEYCODE_B = 2018;
+const KEYCODE_D = 2020;
+const KEYCODE_ALT_LEFT = 2045;
+const KEYCODE_ALT_RIGHT = 2046;
 const KEYCODE_N = 2030;
 const KEYCODE_ESCAPE = 2070;
-const PREF_NAME = 'terminai_settings';
 const PREF_DEFAULT_CWD = 'defaultCwd';
 const DEFAULT_CWD = '~';
 const LEGACY_HOME_CWD = '/storage/Users/currentUser';
@@ -82,10 +85,6 @@ const PREF_REMOTE_SHELLS = 'remoteShells';        // JSON {deviceId: loginShell}
 const PREF_LAST_PROGRAMS = 'lastProgramsByDevice';
 const PREF_SAVED_SESSIONS = 'savedSessions';
 const PREF_CURRENT_SESSION = 'currentSessionIndex';
-const ACTIVITY_TICK_INTERVAL = 250;
-const ACTIVE_PROCESS_INSPECTION_INTERVAL = 750;
-const BACKGROUND_PROCESS_INSPECTION_INTERVAL = 2500;
-const PROCESS_INSPECTION_TIMEOUT = 3500;
 const RENDERER_POOL_LIMIT = 3;
 const STYLE_SAVE_DELAY = 350;
 
@@ -94,10 +93,34 @@ const STYLE_SAVE_DELAY = 350;
 struct Index {
   @State sessions: TerminalSession[] = [];
   @State @Watch('onCurrentSessionChanged') currentIdx: number = -1;
+  /** Rebuilt snapshot driving the primary pane ForEach (reliable diff). */
+  @State private primaryPaneSessions: TerminalSession[] = [];
   @State sidebarCollapsed: boolean = false;
   @State sidebarWidth: number = 280;
   /** Current plus two recent ArkWeb renderers; PTY sessions continue independently when evicted. */
-  @State private renderedSessionUids: number[] = [];
+  @State @Watch('refreshPrimaryPane') private renderedSessionUids: number[] = [];
+  /** herdrm-style temporary shell shown beside the selected agent. */
+  @State @Watch('refreshPrimaryPane') private splitSessionUid: number = -1;
+  /** Live split-pane session object; read directly in @Builder so ArkUI diffing is reliable. */
+  @State private splitPaneSession: TerminalSession | null = null;
+  /** Explicit reactive mirror for the split titlebar's live working directory. */
+  @State private splitPaneCwd: string = '';
+  /** true stacks panes top-to-bottom; false arranges them left-to-right. */
+  @State private splitHorizontal: boolean = false;
+  /** Keyboard focus belongs to the split pane while true. */
+  @State private splitFocused: boolean = false;
+  /** Main-pane share (0.2..0.8); the divider drag updates it. */
+  @State private splitRatio: number = 0.5;
+  @State private splitDragging: boolean = false;
+  @State private splitDividerHovered: boolean = false;
+  @State private splitDragStartX: number = 0;
+  @State private splitDragStartY: number = 0;
+  @State private splitDragStartRatio: number = 0.5;
+  @State private workspaceWidth: number = 0;
+  @State private workspaceHeight: number = 0;
+  @State private terminalFocusRequest: number = 0;
+  /** Explicit fit request sent to both active terminal panes after split layout commits. */
+  @State private terminalLayoutRefreshRequest: number = 0;
   @State defaultCwd: string = DEFAULT_CWD;
   @State private titleSidebarHovered: boolean = false;
   @State private titleSidebarPressed: boolean = false;
@@ -134,21 +157,16 @@ struct Index {
   notificationSessionRequest: string = '';
   private ctrlDown: boolean = false;
   private shiftDown: boolean = false;
+  private altDown: boolean = false;
   /** Prevent @Watch callbacks from writing default values over preferences while they are loading. */
   private loadingStylePrefs: boolean = false;
   private titleTouchDown: boolean = false;
   private titleMoving: boolean = false;
-  private activityTimer: number = -1;
-  private activityInspectionInFlight: boolean = false;
-  private activityInspectionGeneration: number = 0;
-  private activityInspectionTimer: number = -1;
-  private activityScanCursor: number = 0;
-  private mgr: SessionManager = new SessionManager();
-  private notificationStates: Map<number, AgentRunState> = new Map();
-  private sshConnections: SshRuntimeConnection[] = [];
+  private backend: ResidentSessionBackend = ResidentSessionBackend.shared();
+  private mgr: SessionManager = this.backend.sessionManager;
+  private sshConnections: SshRuntimeConnection[] = this.backend.sshConnections;
   private mainWindow: window.Window | undefined = AppStorage.get<window.Window>('mainWindow');
   // Standard modal dialogs.
-  private sessionSaveTimer: number = -1;
   private styleSaveTimer: number = -1;
   private restoringSessions: boolean = false;
   private savedSessionsEncoded: string = '';
@@ -201,9 +219,16 @@ struct Index {
     builder: SearchView({
       getSessions: () => this.sessions,
       onPick: (uid: number) => {
+        if (uid === this.splitSessionUid) {
+          // Keep the split arrangement; just hand the pane focus.
+          this.splitFocused = true;
+          this.terminalFocusRequest++;
+          return;
+        }
         const index = this.sessions.findIndex((session: TerminalSession) => session.uid === uid);
         if (index >= 0) {
           this.currentIdx = index;
+          this.splitFocused = false;
         }
       },
       onPickSpace: (cwd: string, deviceId: string) => {
@@ -223,6 +248,7 @@ struct Index {
       onDeviceSaved: (device: ManagedDevice, credential: string, isNew: boolean) => {
         return this.handleDeviceSaved(device, credential, isNew);
       },
+      onDeviceCommitted: (device: ManagedDevice) => { this.handleDeviceCommitted(device); },
       onDeviceRemoved: (device: ManagedDevice) => { this.handleDeviceRemoved(device); },
       onConnect: (device: ManagedDevice) => { this.connectAndOpenTerminal(device); }
     }),
@@ -245,7 +271,11 @@ struct Index {
     this.saveSessionsSoon();
     const session = this.currentIdx >= 0 && this.currentIdx < this.sessions.length ?
       this.sessions[this.currentIdx] : null;
-    if (session === null) return;
+    if (session === null) {
+      this.backend.setSelectedSessionUid(-1);
+      return;
+    }
+    this.backend.setSelectedSessionUid(session.uid);
     SessionNotificationService.cancelSession(session.uid);
     this.touchRenderedSession(session.uid);
     // TerminalView requests focus after its ArkWeb is mounted, visible and
@@ -266,6 +296,12 @@ struct Index {
     this.renderedSessionUids = next;
   }
 
+  /** Rebuild the primary-pane list from the renderer pool + current session. */
+  private refreshPrimaryPane(): void {
+    this.primaryPaneSessions = this.renderedSessions()
+      .filter((session: TerminalSession) => session.uid !== this.splitSessionUid);
+  }
+
   private renderedSessions(): TerminalSession[] {
     const current = this.currentSession();
     return this.sessions.filter((session: TerminalSession) =>
@@ -273,46 +309,107 @@ struct Index {
       this.renderedSessionUids.some((uid: number) => uid === session.uid));
   }
 
-  private savedSessionInfo(session: TerminalSession): SavedSessionInfo {
-    return new SavedSessionInfo(session.cwd, session.cmd, session.agentKind,
-      session.agentIconKind, session.deviceId, session.name, session.manualTitle,
-      session.sequence, session.shellName);
+  /** A pane's ArkWeb node gained focus: that pane owns keyboard shortcuts. */
+  private onPaneFocused(uid: number): void {
+    if (this.splitSessionUid < 0) {
+      return;
+    }
+    const focusedSplit = uid === this.splitSessionUid;
+    if (focusedSplit !== this.splitFocused) {
+      this.splitFocused = focusedSplit;
+    }
+  }
+
+  private splitSession(): TerminalSession | null {
+    const session = this.sessions.find((item: TerminalSession) => item.uid === this.splitSessionUid);
+    return session === undefined ? null : session;
+  }
+
+  private deviceForSession(session: TerminalSession): ManagedDevice {
+    const saved = decodeDevices(this.devicesEncoded).find((device: ManagedDevice) =>
+      device.id === session.deviceId);
+    return saved === undefined ?
+      new ManagedDevice(session.deviceId, session.deviceName, session.sshTarget) : saved;
+  }
+
+  private showMessage(message: string): void {
+    try {
+      this.getUIContext().getPromptAction().showToast({ message: message });
+    } catch (error) {
+      console.error('TERMINAI show split message failed: ' + JSON.stringify(error));
+    }
+  }
+
+  /** Wait one task so ArkUI has applied the new split geometry before xterm measures it. */
+  private scheduleSplitLayoutRefresh(): void {
+    const expectedSplitUid = this.splitSessionUid;
+    setTimeout(() => {
+      if (expectedSplitUid > 0 && this.splitSessionUid === expectedSplitUid) {
+        this.terminalLayoutRefreshRequest++;
+      }
+    }, 0);
+  }
+
+  private openSplit(horizontal: boolean): void {
+    const current = this.currentSession();
+    if (current === null) {
+      this.showMessage('请先选择一个会话再打开分屏');
+      return;
+    }
+    if (this.splitSession() !== null) {
+      if (this.splitHorizontal === horizontal) {
+        this.closeSplit();
+        return;
+      }
+      this.splitHorizontal = horizontal;
+      this.scheduleSplitLayoutRefresh();
+      return;
+    }
+    const device = this.deviceForSession(current);
+    if (!device.isLocal()) {
+      const connection = this.sshConnection(device.id);
+      if (connection === null || !connection.isReady()) {
+        this.showMessage('远程设备连接完成后才能打开分屏');
+        this.connectDevice(device, false).catch(() => {});
+        return;
+      }
+    }
+    const shell = this.newSession(current.cwd, '', '', '', device,
+      current.sshTarget.length > 0 ? current.shellName : 'zsh', '', false, 0, false);
+    if (shell === null) {
+      this.showMessage('远程设备连接完成后才能打开分屏');
+      return;
+    }
+    this.splitHorizontal = horizontal;
+    this.splitSessionUid = shell.uid;
+    this.splitPaneSession = shell;
+    this.splitPaneCwd = shell.cwd;
+    this.splitRatio = 0.5;
+    this.splitFocused = true;
+    this.terminalFocusRequest++;
+    this.scheduleSplitLayoutRefresh();
+  }
+
+  private closeSplit(removeShell: boolean = true): void {
+    const shell = this.splitSession();
+    this.splitSessionUid = -1;
+    this.splitPaneSession = null;
+    this.splitPaneCwd = '';
+    this.splitFocused = false;
+    this.terminalFocusRequest++;
+    if (removeShell && shell !== null) {
+      this.closeSession(shell);
+    }
   }
 
   private saveSessionsSoon(): void {
     if (this.restoringSessions) return;
-    if (this.sessionSaveTimer >= 0) clearTimeout(this.sessionSaveTimer);
-    this.sessionSaveTimer = setTimeout(() => {
-      this.sessionSaveTimer = -1;
-      this.saveSessionsNow();
-    }, 80);
+    this.backend.schedulePersistence();
   }
 
   private saveSessionsNow(): void {
     if (this.restoringSessions) return;
-    const items: SavedSessionInfo[] = [];
-    for (const session of this.mgr.sessions) {
-      items.push(this.savedSessionInfo(session));
-    }
-    for (const connection of this.sshConnections) {
-      for (const pending of connection.pendingSessions) {
-        items.push(new SavedSessionInfo(pending.cwd, pending.cmd, pending.label,
-          pending.iconKind, connection.deviceId, pending.title, pending.manualTitle,
-          pending.sequence > 0 ? pending.sequence : 1,
-          pending.shellName.length > 0 ? pending.shellName : 'sh'));
-      }
-    }
-    try {
-      const context = this.getUIContext().getHostContext();
-      if (context === undefined) return;
-      const store = preferences.getPreferencesSync(context, { name: PREF_NAME });
-      this.savedSessionsEncoded = encodeSavedSessions(items);
-      store.putSync(PREF_SAVED_SESSIONS, this.savedSessionsEncoded);
-      store.putSync(PREF_CURRENT_SESSION, this.currentIdx);
-      store.flush();
-    } catch (error) {
-      console.error('TERMINAI save sessions failed: ' + JSON.stringify(error));
-    }
+    this.backend.flushPersistence();
   }
 
   private restoreSavedSessions(): boolean {
@@ -340,39 +437,37 @@ struct Index {
     this.loadDefaultCwd();
     this.loadStylePrefs();
     this.applyIsDark();
-    // Route native events to the right session.
-    this.mgr.dispatch = (ev: SessionEvent) => {
-      const s = this.sessions.find((it) => it.id === ev.id);
-      if (s) {
-        s.handleEvent(ev);
-        if (ev.kind === 'cwd') {
-          // Working directory changed: refresh sidebar grouping.
-          this.sessions = [...this.sessions];
-        }
-        if (ev.kind === 'exit' && s.id > 0) {
-          // Remove the native id immediately; process/thread cleanup runs in a
-          // native async worker and never joins from the ArkUI callback thread.
-          const deadId = s.id;
-          libterminal.killSessionAsync(deadId)
-            .catch((error: Error) => {
-              console.error('TERMINAI async exited-session cleanup failed: ' + error.message);
-            });
-          s.id = -1;
-        }
+    // Native dispatch is process-owned. This observer only refreshes the
+    // currently attached page and can be replaced without touching PTYs.
+    this.mgr.onEvent = (session: TerminalSession, ev: SessionEvent) => {
+      if (ev.kind === 'cwd' || ev.kind === 'exit') {
+        this.sessions = [...this.mgr.sessions];
       }
     };
-    const restoredSessions = this.restoreSavedSessions();
+    let restoredSessions = false;
+    if (this.backend.hasRuntimeSessions()) {
+      for (const session of this.mgr.sessions) {
+        this.bindSessionCallbacks(session);
+      }
+      this.sessions = [...this.mgr.sessions];
+      const selectedUid = this.backend.selectedSession();
+      const selectedIndex = this.sessions.findIndex((session: TerminalSession) =>
+        session.uid === selectedUid);
+      this.currentIdx = selectedIndex >= 0 ? selectedIndex : this.sessions.length - 1;
+      restoredSessions = true;
+    } else {
+      restoredSessions = this.restoreSavedSessions();
+    }
     if (!restoredSessions && this.autoNewSession) {
       this.newSession();
     }
+    this.publishSshStates();
+    BackgroundSessionService.setLiveSessionCount(this.backend.liveSessionCount());
     this.routeNotificationSelection();
     // Auto-connect saved SSH hosts (best-effort, no password prompts).
     if (this.autoConnectSsh) {
       this.autoConnectSavedDevices();
     }
-    this.activityTimer = setInterval(() => {
-      this.refreshActivityStates();
-    }, ACTIVITY_TICK_INTERVAL);
   }
 
   private autoConnectSavedDevices(): void {
@@ -390,7 +485,7 @@ struct Index {
         AppStorage.setOrCreate('defaultCwd', this.defaultCwd);
         return;
       }
-      const store = preferences.getPreferencesSync(ctx, { name: PREF_NAME });
+      const store = TerminaiPreferences.get(ctx);
       const saved = store.getSync(PREF_DEFAULT_CWD, DEFAULT_CWD) as string;
       const trimmed = saved.trim();
       // Older builds could persist the developer workspace as the startup
@@ -399,7 +494,7 @@ struct Index {
         trimmed === '~/AICoding') {
         this.defaultCwd = DEFAULT_CWD;
         store.putSync(PREF_DEFAULT_CWD, DEFAULT_CWD);
-        store.flush();
+        store.flushSync();
       } else {
         this.defaultCwd = trimmed;
       }
@@ -415,9 +510,9 @@ struct Index {
       if (ctx === undefined) {
         return;
       }
-      const store = preferences.getPreferencesSync(ctx, { name: PREF_NAME });
+      const store = TerminaiPreferences.get(ctx);
       store.putSync(PREF_DEFAULT_CWD, cwd);
-      store.flush();
+      store.flushSync();
       this.defaultCwd = cwd;
       AppStorage.setOrCreate('defaultCwd', cwd);
     } catch (e) {
@@ -426,125 +521,20 @@ struct Index {
   }
 
   aboutToDisappear(): void {
-    if (this.activityTimer >= 0) {
-      clearInterval(this.activityTimer);
-      this.activityTimer = -1;
-    }
     this.saveStylePrefs();
     if (this.styleSaveTimer >= 0) {
       clearTimeout(this.styleSaveTimer);
       this.styleSaveTimer = -1;
     }
-    if (this.activityInspectionTimer >= 0) {
-      clearTimeout(this.activityInspectionTimer);
-      this.activityInspectionTimer = -1;
-    }
-    this.activityInspectionGeneration++;
-    this.activityInspectionInFlight = false;
-    if (this.sessionSaveTimer >= 0) {
-      clearTimeout(this.sessionSaveTimer);
-      this.sessionSaveTimer = -1;
-    }
     this.saveSessionsNow();
-    for (const connection of [...this.sshConnections]) {
-      this.disconnectDevice(connection.deviceId, true);
+    // Detach only the ArkUI observers. EntryAbility owns the explicit shutdown
+    // path; a page/window rebuild must leave PTY and SSH sessions running.
+    this.mgr.onEvent = () => {};
+    for (const session of this.mgr.sessions) {
+      session.onStateChanged = () => {};
+      session.onMetadataChanged = () => {};
+      session.onCwdChanged = () => {};
     }
-    this.mgr.removeAll();
-  }
-
-  private refreshActivityStates(): void {
-    const now = Date.now();
-    for (const session of this.sessions) {
-      if (session.isAgentSession()) {
-        session.updateActivity(now);
-      }
-    }
-    if (this.activityInspectionInFlight || this.sessions.length === 0) {
-      return;
-    }
-
-    let candidate: TerminalSession | null = null;
-    const active = this.currentSession();
-    if (active !== null && active.isAgentSession() && active.id > 0 && active.alive &&
-      now - active.lastProcessInspectionAt >= ACTIVE_PROCESS_INSPECTION_INTERVAL) {
-      candidate = active;
-    } else {
-      const count = this.sessions.length;
-      for (let offset = 0; offset < count; offset++) {
-        const index = (this.activityScanCursor + offset) % count;
-        const session = this.sessions[index];
-        if (!session.isAgentSession() || session.id <= 0 || !session.alive) {
-          continue;
-        }
-        const interval = session.uid === (active === null ? -1 : active.uid) ?
-          ACTIVE_PROCESS_INSPECTION_INTERVAL : BACKGROUND_PROCESS_INSPECTION_INTERVAL;
-        if (now - session.lastProcessInspectionAt < interval) {
-          continue;
-        }
-        candidate = session;
-        this.activityScanCursor = (index + 1) % count;
-        break;
-      }
-    }
-    if (candidate === null) {
-      return;
-    }
-
-    const expectedUid = candidate.uid;
-    const expectedNativeId = candidate.id;
-    candidate.lastProcessInspectionAt = now;
-    this.activityInspectionInFlight = true;
-    this.activityInspectionGeneration++;
-    const inspectionGeneration = this.activityInspectionGeneration;
-    if (this.activityInspectionTimer >= 0) {
-      clearTimeout(this.activityInspectionTimer);
-    }
-    this.activityInspectionTimer = setTimeout(() => {
-      if (this.activityInspectionGeneration !== inspectionGeneration) {
-        return;
-      }
-      this.activityInspectionTimer = -1;
-      this.activityInspectionGeneration++;
-      this.activityInspectionInFlight = false;
-      const session = this.sessions.find((item: TerminalSession) =>
-        item.uid === expectedUid && item.id === expectedNativeId && !item.disposed);
-      if (session !== undefined) {
-        session.processSignalAvailable = false;
-      }
-      console.error('TERMINAI async process inspection timed out');
-    }, PROCESS_INSPECTION_TIMEOUT);
-    const inspection: Promise<SessionProcessInfo> = libterminal.inspectSessionAsync(expectedNativeId);
-    inspection.then((process: SessionProcessInfo) => {
-      if (this.activityInspectionGeneration !== inspectionGeneration) {
-        return;
-      }
-      if (this.activityInspectionTimer >= 0) {
-        clearTimeout(this.activityInspectionTimer);
-        this.activityInspectionTimer = -1;
-      }
-      const session = this.sessions.find((item: TerminalSession) =>
-        item.uid === expectedUid && item.id === expectedNativeId && !item.disposed);
-      if (session !== undefined) {
-        session.updateProcess(process);
-        session.updateActivity(Date.now());
-      }
-      this.activityInspectionInFlight = false;
-    }).catch((error: Error) => {
-      if (this.activityInspectionGeneration !== inspectionGeneration) {
-        return;
-      }
-      if (this.activityInspectionTimer >= 0) {
-        clearTimeout(this.activityInspectionTimer);
-        this.activityInspectionTimer = -1;
-      }
-      const session = this.sessions.find((item: TerminalSession) =>
-        item.uid === expectedUid && item.id === expectedNativeId && !item.disposed);
-      if (session !== undefined) {
-        session.processSignalAvailable = false;
-      }
-      this.activityInspectionInFlight = false;
-      console.error('TERMINAI async process inspection failed: ' + error.message);
-    });
   }
 
   private saveCustomAgents(value: string): void {
@@ -553,13 +543,9 @@ struct Index {
       if (ctx === undefined) {
         return;
       }
-      const store = preferences.getPreferencesSync(ctx, { name: PREF_NAME });
+      const store = TerminaiPreferences.get(ctx);
       store.putSync(PREF_CUSTOM_AGENTS, value);
-      store.flush((error: BusinessError) => {
-        if (error) {
-          console.error('TERMINAI save custom agents failed: ' + JSON.stringify(error));
-        }
-      });
+      store.flushSync();
     } catch (e) {
       console.error('TERMINAI save custom agents failed: ' + JSON.stringify(e));
     }
@@ -589,9 +575,9 @@ struct Index {
     try {
       const context = this.getUIContext().getHostContext();
       if (context !== undefined) {
-        const store = preferences.getPreferencesSync(context, { name: PREF_NAME });
+        const store = TerminaiPreferences.get(context);
         store.putSync(PREF_SELECTED_DEVICE, id);
-        store.flush();
+        store.flushSync();
       }
     } catch (e) {
       console.error('TERMINAI save selected device failed: ' + JSON.stringify(e));
@@ -621,10 +607,10 @@ struct Index {
     try {
       const context = this.getUIContext().getHostContext();
       if (context !== undefined) {
-        const store = preferences.getPreferencesSync(context, { name: PREF_NAME });
+        const store = TerminaiPreferences.get(context);
         store.putSync(PREF_DEVICES, value);
         store.putSync(PREF_SELECTED_DEVICE, this.selectedDeviceId);
-        store.flush();
+        store.flushSync();
       }
     } catch (e) {
       console.error('TERMINAI save devices failed: ' + JSON.stringify(e));
@@ -698,6 +684,7 @@ struct Index {
     }
     const masterId = connection.masterId;
     const scanId = connection.scanId;
+    connection.invalidate(true);
     connection.masterId = -1;
     connection.scanId = -1;
     connection.pendingSessions = [];
@@ -706,8 +693,7 @@ struct Index {
     this.cleanupNativeSession(scanId);
     this.cleanupNativeSession(masterId);
     if (removeRuntime) {
-      this.sshConnections = this.sshConnections.filter((item: SshRuntimeConnection) =>
-        item.deviceId !== deviceId);
+      this.backend.removeSshConnection(connection);
       this.publishSshStates();
     }
   }
@@ -727,10 +713,15 @@ struct Index {
     } else if (isNew) {
       await SshCredentialStore.remove(device.id, credentialKind);
     }
+    return true;
+  }
+
+  private handleDeviceCommitted(device: ManagedDevice): void {
     this.selectDevice(device.id);
     this.disconnectDevice(device.id);
-    await this.connectDevice(device, false);
-    return true;
+    this.connectDevice(device, false).catch((error: Error) => {
+      console.error('TERMINAI connect committed SSH device failed: ' + error.message);
+    });
   }
 
   private handleDeviceRemoved(device: ManagedDevice): void {
@@ -812,6 +803,7 @@ struct Index {
       return;
     }
 
+    const generation = connection.beginAttempt();
     connection.target = device.sshTarget;
     connection.controlPath = '';
     connection.credentialAvailable = false;
@@ -821,7 +813,8 @@ struct Index {
     this.setConnectionState(connection, SshConnectionState.Connecting);
 
     const secret = new SshSecretValue(await SshCredentialStore.loadForDevice(device));
-    if (connection.state !== SshConnectionState.Connecting) {
+    if (!connection.isCurrentAttempt(generation) ||
+      connection.state !== SshConnectionState.Connecting) {
       secret.value = '';
       return;
     }
@@ -829,65 +822,156 @@ struct Index {
       const command = this.buildMasterCommand(connection, device);
       const activeConnection: SshRuntimeConnection = connection;
       connection.credentialAvailable = secret.value.length > 0;
-      connection.masterId = libterminal.createSessionWithSecret(80, 24, '~', command, secret.value,
+      const nativeId = libterminal.createSessionWithSecret(80, 24, '~', command, secret.value,
         (event: SessionEvent) => {
-          this.handleMasterEvent(activeConnection, event);
+          this.handleMasterEvent(activeConnection, generation, event);
         });
       secret.value = '';
+      if (!connection.completeMasterStart(generation, nativeId) &&
+        !connection.isCurrentAttempt(generation)) {
+        this.cleanupNativeSession(nativeId);
+      }
     } catch (e) {
       secret.value = '';
-      connection.masterId = -1;
-      this.setConnectionState(connection, SshConnectionState.Failed);
+      if (connection.isCurrentAttempt(generation)) {
+        this.failConnection(connection, generation, SshConnectionState.Failed,
+          '无法创建 SSH 连接进程', false);
+      }
     }
   }
 
-  private failConnection(connection: SshRuntimeConnection, state: SshConnectionState): void {
+  private failConnection(connection: SshRuntimeConnection, generation: number,
+    state: SshConnectionState, reason: string, retryable: boolean): void {
+    if (!connection.isCurrentAttempt(generation)) {
+      return;
+    }
     const masterId = connection.masterId;
-    connection.masterId = -1;
+    connection.markMasterExited(generation);
     connection.connectedMarkerSeen = false;
+    connection.lastError = reason;
     this.setConnectionState(connection, state);
     this.cleanupNativeSession(masterId);
+    if (retryable) {
+      this.scheduleConnectionRetry(connection, reason);
+    } else {
+      this.cancelPendingRemoteSessions(connection, reason);
+    }
   }
 
-  private handleMasterEvent(connection: SshRuntimeConnection, event: SessionEvent): void {
+  /**
+   * A credential or host-key failure cannot recover through backoff. Pending
+   * requests must not remain in savedSessions and unexpectedly open after a
+   * later successful login.
+   */
+  private cancelPendingRemoteSessions(connection: SshRuntimeConnection, reason: string): void {
+    const count = connection.pendingSessions.length;
+    connection.pendingSessions = [];
+    connection.openTerminalOnReady = false;
+    this.backend.schedulePersistence();
+    if (count <= 0) {
+      return;
+    }
+    try {
+      this.getUIContext().getPromptAction().showToast({
+        message: reason + '，已取消 ' + count.toString() + ' 个待创建会话'
+      });
+    } catch (error) {
+      console.error('TERMINAI show cancelled pending sessions failed: ' + JSON.stringify(error));
+    }
+  }
+
+  private scheduleConnectionRetry(connection: SshRuntimeConnection, reason: string): void {
+    if (connection.manualDisconnect) {
+      return;
+    }
+    const scanId = connection.scanId;
+    if (scanId > 0) {
+      connection.markScanExited(connection.attemptGeneration);
+      this.cleanupNativeSession(scanId);
+    }
+    const device = decodeDevices(this.devicesEncoded).find((item: ManagedDevice) =>
+      item.id === connection.deviceId);
+    if (device === undefined) {
+      this.setConnectionState(connection, SshConnectionState.Disconnected);
+      return;
+    }
+    connection.clearRetryTimer();
+    const delay = connection.nextRetryDelay();
+    connection.lastError = reason;
+    connection.nextRetryAt = Date.now() + delay;
+    this.setConnectionState(connection, SshConnectionState.Reconnecting);
+    connection.retryTimer = setTimeout(() => {
+      connection.retryTimer = -1;
+      connection.nextRetryAt = 0;
+      if (connection.manualDisconnect) {
+        return;
+      }
+      this.connectDevice(device, false).catch(() => {
+        if (!connection.manualDisconnect && connection.state !== SshConnectionState.Reconnecting) {
+          this.scheduleConnectionRetry(connection, 'SSH 自动重连失败');
+        }
+      });
+    }, delay);
+  }
+
+  private handleMasterEvent(connection: SshRuntimeConnection, generation: number,
+    event: SessionEvent): void {
+    if (!connection.acceptMasterEvent(generation, event.id)) {
+      return;
+    }
     if (event.kind === 'output') {
-      connection.authOutput = (connection.authOutput + event.data).slice(-8000);
-      const lower = connection.authOutput.toLowerCase();
-      if (connection.authOutput.indexOf(SSH_CONNECTED_MARKER) >= 0 && !connection.connectedMarkerSeen) {
+      // Classify the complete incoming chunk before bounding retained output.
+      // Otherwise a large login banner can push an error at the beginning of
+      // the same native event outside a small rolling window.
+      const combinedAuthOutput = connection.authOutput + event.data;
+      const lower = combinedAuthOutput.toLowerCase();
+      connection.authOutput = combinedAuthOutput.slice(-65536);
+      if (combinedAuthOutput.indexOf(SSH_CONNECTED_MARKER) >= 0 && !connection.connectedMarkerSeen) {
         connection.connectedMarkerSeen = true;
-        this.startRemoteAgentScan(connection).catch(() => {
-          this.finishRemoteScan(connection, false);
+        connection.markConnected();
+        this.startRemoteAgentScan(connection, generation).catch(() => {
+          this.finishRemoteScan(connection, generation, false);
         });
         return;
       }
-      if (this.hasSshCredentialPrompt(lower)) {
-        // The native PTY reader injects a stored password or key passphrase
-        // before this asynchronous UI callback runs.
-        if (!connection.credentialAvailable) {
-          this.failConnection(connection, SshConnectionState.NeedsCredential);
-        }
-        return;
-      }
       if (lower.indexOf('permission denied') >= 0) {
-        this.failConnection(connection, SshConnectionState.AuthFailed);
+        this.failConnection(connection, generation, SshConnectionState.AuthFailed,
+          'SSH 登录凭据被拒绝', false);
       } else if (lower.indexOf('host key verification failed') >= 0 ||
-        lower.indexOf('connection refused') >= 0 || lower.indexOf('no route to host') >= 0) {
-        this.failConnection(connection, SshConnectionState.Failed);
+        lower.indexOf('remote host identification has changed') >= 0) {
+        this.failConnection(connection, generation, SshConnectionState.HostKeyFailed,
+          'SSH 主机密钥校验失败', false);
+      } else if (lower.indexOf('connection refused') >= 0 ||
+        lower.indexOf('no route to host') >= 0 || lower.indexOf('connection timed out') >= 0 ||
+        lower.indexOf('operation timed out') >= 0) {
+        this.failConnection(connection, generation, SshConnectionState.NetworkFailed,
+          'SSH 主机暂时不可达', true);
+      } else if (this.hasSshCredentialPrompt(lower)) {
+        // The native PTY reader injects a stored password or key passphrase
+        // before this asynchronous UI callback runs. Check fatal errors first
+        // because a single PTY chunk may contain both prompt and rejection.
+        if (!connection.credentialAvailable) {
+          this.failConnection(connection, generation, SshConnectionState.NeedsCredential,
+            'SSH 主机要求登录凭据', false);
+        }
       }
       return;
     }
     if (event.kind === 'exit') {
       this.cleanupNativeSession(event.id);
-      if (connection.masterId !== event.id) {
-        return;
-      }
-      connection.masterId = -1;
+      connection.markMasterExited(generation);
       if (connection.connectedMarkerSeen) {
-        this.setConnectionState(connection, SshConnectionState.Disconnected);
+        connection.connectedMarkerSeen = false;
+        this.scheduleConnectionRetry(connection, 'SSH 连接已中断');
       } else if (connection.state === SshConnectionState.Connecting) {
         const lower = connection.authOutput.toLowerCase();
-        this.setConnectionState(connection, lower.indexOf('permission denied') >= 0 ?
-          SshConnectionState.AuthFailed : SshConnectionState.Failed);
+        if (lower.indexOf('permission denied') >= 0) {
+          this.setConnectionState(connection, SshConnectionState.AuthFailed);
+          this.cancelPendingRemoteSessions(connection, 'SSH 登录凭据被拒绝');
+        } else {
+          connection.lastError = 'SSH 连接在认证完成前退出';
+          this.scheduleConnectionRetry(connection, connection.lastError);
+        }
       }
     }
   }
@@ -937,7 +1021,11 @@ struct Index {
       this.shellQuote(normalizedSshTarget(connection.target)) + ' ' + this.shellQuote(remoteScript);
   }
 
-  private async startRemoteAgentScan(connection: SshRuntimeConnection): Promise<void> {
+  private async startRemoteAgentScan(connection: SshRuntimeConnection,
+    generation: number): Promise<void> {
+    if (!connection.isCurrentAttempt(generation)) {
+      return;
+    }
     if (connection.scanId > 0) {
       return;
     }
@@ -946,24 +1034,29 @@ struct Index {
     const device = decodeDevices(this.devicesEncoded).find((item: ManagedDevice) =>
       item.id === connection.deviceId);
     if (device === undefined) {
-      this.finishRemoteScan(connection, false);
+      this.finishRemoteScan(connection, generation, false);
       return;
     }
     const secret = new SshSecretValue(await SshCredentialStore.loadForDevice(device));
-    if (connection.state !== SshConnectionState.Scanning) {
+    if (!connection.isCurrentAttempt(generation) ||
+      connection.state !== SshConnectionState.Scanning) {
       secret.value = '';
       return;
     }
     try {
       const command = this.buildRemoteScanCommand(connection, device);
-      connection.scanId = libterminal.createSessionWithSecret(80, 24, '~', command, secret.value,
+      const nativeId = libterminal.createSessionWithSecret(80, 24, '~', command, secret.value,
         (event: SessionEvent) => {
-          this.handleRemoteScanEvent(connection, event);
+          this.handleRemoteScanEvent(connection, generation, event);
         });
       secret.value = '';
+      if (!connection.completeScanStart(generation, nativeId) &&
+        !connection.isCurrentAttempt(generation)) {
+        this.cleanupNativeSession(nativeId);
+      }
     } catch (e) {
       secret.value = '';
-      this.finishRemoteScan(connection, false);
+      this.finishRemoteScan(connection, generation, false);
     }
   }
 
@@ -981,7 +1074,8 @@ struct Index {
     return '';
   }
 
-  private parseRemoteAgents(connection: SshRuntimeConnection): RemoteAgentInfo[] {    const agents: RemoteAgentInfo[] = [];
+  private parseRemoteAgents(connection: SshRuntimeConnection): RemoteAgentInfo[] {
+    const agents: RemoteAgentInfo[] = [];
     const candidates = this.remoteAgentCandidates();
     for (const rawLine of connection.scanOutput.split('\n')) {
       const line = rawLine.replace(/\r/g, '');
@@ -1001,22 +1095,27 @@ struct Index {
     return agents;
   }
 
-  private handleRemoteScanEvent(connection: SshRuntimeConnection, event: SessionEvent): void {
+  private handleRemoteScanEvent(connection: SshRuntimeConnection, generation: number,
+    event: SessionEvent): void {
+    if (!connection.acceptScanEvent(generation, event.id)) {
+      return;
+    }
     if (event.kind === 'output') {
       connection.scanOutput += event.data;
       return;
     }
     if (event.kind === 'exit') {
       this.cleanupNativeSession(event.id);
-      if (connection.scanId !== event.id) {
-        return;
-      }
-      connection.scanId = -1;
-      this.finishRemoteScan(connection, event.exitCode === 0);
+      connection.markScanExited(generation);
+      this.finishRemoteScan(connection, generation, event.exitCode === 0);
     }
   }
 
-  private finishRemoteScan(connection: SshRuntimeConnection, success: boolean): void {
+  private finishRemoteScan(connection: SshRuntimeConnection, generation: number,
+    success: boolean): void {
+    if (!connection.isCurrentAttempt(generation) || connection.masterId <= 0) {
+      return;
+    }
     if (success) {
       const agents = this.parseRemoteAgents(connection);
       connection.remoteShell = this.parseRemoteShell(connection);
@@ -1061,9 +1160,9 @@ struct Index {
       if (context === undefined) {
         return;
       }
-      const store = preferences.getPreferencesSync(context, { name: PREF_NAME });
+      const store = TerminaiPreferences.get(context);
       store.putSync(PREF_REMOTE_AGENTS, this.remoteAgentsEncoded);
-      store.flush();
+      store.flushSync();
     } catch (e) {
       console.error('TERMINAI save remote agents failed: ' + JSON.stringify(e));
     }
@@ -1076,7 +1175,7 @@ struct Index {
       if (context === undefined || shell.length === 0) {
         return;
       }
-      const store = preferences.getPreferencesSync(context, { name: PREF_NAME });
+      const store = TerminaiPreferences.get(context);
       let map: Record<string, string> = {};
       try {
         map = JSON.parse(store.getSync(PREF_REMOTE_SHELLS, '{}') as string) as Record<string, string>;
@@ -1085,7 +1184,7 @@ struct Index {
       }
       map[deviceId] = shell;
       store.putSync(PREF_REMOTE_SHELLS, JSON.stringify(map));
-      store.flush();
+      store.flushSync();
     } catch (e) {
       console.error('TERMINAI save remote shell failed: ' + JSON.stringify(e));
     }
@@ -1126,7 +1225,7 @@ struct Index {
       if (ctx === undefined) {
         return;
       }
-      const store = preferences.getPreferencesSync(ctx, { name: PREF_NAME });
+      const store = TerminaiPreferences.get(ctx);
       const size = store.getSync(PREF_FONT_SIZE, 14) as number;
       const bold = store.getSync(PREF_FONT_BOLD, false) as boolean;
       const mode = store.getSync(PREF_THEME_MODE, 'system') as string;
@@ -1137,6 +1236,9 @@ struct Index {
       const savedLastPrograms = store.getSync(PREF_LAST_PROGRAMS, '') as string;
       this.savedSessionsEncoded = store.getSync(PREF_SAVED_SESSIONS, '') as string;
       this.savedCurrentSessionIndex = store.getSync(PREF_CURRENT_SESSION, -1) as number;
+      console.info('TERMINAI session snapshot loaded count=' +
+        decodeSavedSessions(this.savedSessionsEncoded).length.toString() +
+        ' selected=' + this.savedCurrentSessionIndex.toString());
       let savedDeviceId = store.getSync(PREF_SELECTED_DEVICE, '') as string;
       if (savedDeviceId.length > 0 && !decodeDevices(savedDevices).some((item: ManagedDevice) =>
         item.id === savedDeviceId)) {
@@ -1198,7 +1300,7 @@ struct Index {
       if (ctx === undefined) {
         return;
       }
-      const store = preferences.getPreferencesSync(ctx, { name: PREF_NAME });
+      const store = TerminaiPreferences.get(ctx);
       store.putSync(PREF_FONT_SIZE, this.fontSize);
       store.putSync(PREF_FONT_BOLD, this.fontBold);
       store.putSync(PREF_THEME_MODE, this.themeMode);
@@ -1214,12 +1316,11 @@ struct Index {
       store.putSync(PREF_LINE_HEIGHT, this.lineHeight);
       store.putSync(PREF_FONT_FAMILY, this.fontFamily);
       store.putSync(PREF_AGENT_OVERRIDES, this.agentOverrides);
-      store.putSync(PREF_CUSTOM_AGENTS, this.customAgents);
-      store.putSync(PREF_DEVICES, this.devicesEncoded);
-      store.putSync(PREF_SELECTED_DEVICE, this.selectedDeviceId);
-      store.putSync(PREF_REMOTE_AGENTS, this.remoteAgentsEncoded);
       store.putSync(PREF_LAST_PROGRAMS, this.lastProgramsByDevice);
-      store.flush();
+      // Device, credential catalog and custom-agent writes have dedicated
+      // commit paths. Do not rewrite those keys from this debounce, otherwise
+      // two snapshots can race during process termination.
+      store.flushSync();
     } catch (e) {
       console.error('TERMINAI save style prefs failed: ' + JSON.stringify(e));
     }
@@ -1263,6 +1364,7 @@ struct Index {
     }
     const current = this.currentSession();
     if (current !== null) {
+      this.backend.setSelectedSessionUid(current.uid);
       SessionNotificationService.cancelSession(current.uid);
     }
   }
@@ -1317,43 +1419,18 @@ struct Index {
       if (ctx === undefined) {
         return;
       }
-      const store = preferences.getPreferencesSync(ctx, { name: PREF_NAME });
+      const store = TerminaiPreferences.get(ctx);
       store.putSync(PREF_RECENT_PATHS, JSON.stringify(list));
-      store.flush();
+      store.flushSync();
     } catch (e) {
       console.error('TERMINAI save recents failed: ' + JSON.stringify(e));
-    }
-  }
-
-  private handleSessionNotificationState(s: TerminalSession): void {
-    const previous = this.notificationStates.get(s.uid) ?? AgentRunState.Unknown;
-    const current = s.alive ? s.activityState : AgentRunState.Exited;
-    this.notificationStates.set(s.uid, current);
-    if (previous === current) {
-      return;
-    }
-    if (SessionNotificationService.isAttentionState(current)) {
-      const index = this.sessions.indexOf(s);
-      const userIsLooking = this.appForeground && index === this.currentIdx;
-      if (this.notifyEnabled && !userIsLooking) {
-        SessionNotificationService.publishSession(s, current)
-          .catch((error: BusinessError) => {
-            hilog.warn(DOMAIN, 'terminAI', 'publish session notification failed: %{public}s',
-              JSON.stringify(error));
-          });
-      }
-      return;
-    }
-    // Output resumed, so an old "waiting for input" notification is stale.
-    if (current === AgentRunState.Outputting || current === AgentRunState.Silent) {
-      SessionNotificationService.cancelSession(s.uid);
     }
   }
 
   private newSession(startCwd: string = '', cmd: string = '', label: string = '',
     iconKind: string = '', device: ManagedDevice = localDevice(), shellName: string = '',
     restoredTitle: string = '', restoredManualTitle: boolean = false,
-    preferredSequence: number = 0, focusSession: boolean = true): void {
+    preferredSequence: number = 0, focusSession: boolean = true): TerminalSession | null {
     const cwd = startCwd.length > 0 ? startCwd : (device.isLocal() ? this.defaultCwd : '~');
     let finalShell = shellName.length > 0 ? shellName : (device.isLocal() ? 'zsh' : 'sh');
     // For remote terminals the login shell is the host's $SHELL (e.g. bash);
@@ -1378,7 +1455,7 @@ struct Index {
           restoredTitle, restoredManualTitle, preferredSequence, finalShell, focusSession));
         this.saveSessionsSoon();
         this.connectDevice(device, false).catch(() => {});
-        return;
+        return null;
       }
       controlPath = connection.controlPath;
       knownHostsPath = this.connectionFilePath(device.id, '-known-hosts');
@@ -1389,24 +1466,42 @@ struct Index {
       s.name = restoredTitle;
       s.manualTitle = restoredManualTitle;
     }
-    s.onNativeEvent = (event: SessionEvent) => { this.mgr.dispatch(event); };
-    this.notificationStates.set(s.uid, s.activityState);
-    s.onStateChanged = () => {
-      this.handleSessionNotificationState(s);
-      // Keep exited sessions visible until the user closes them so the
-      // "会话已退出" state remains truthful and recoverable.
-      this.sessions = [...this.sessions];
-    };
-    s.onMetadataChanged = () => { this.saveSessionsSoon(); };
-    s.onCwdChanged = () => {
-      this.sessions = [...this.sessions];
-      this.saveSessionsSoon();
-    };
+    this.bindSessionCallbacks(s);
     this.sessions = [...this.mgr.sessions];
     if (focusSession || this.currentIdx < 0) {
       this.currentIdx = this.sessions.length - 1;
     }
     this.saveSessionsSoon();
+    return s;
+  }
+
+  private bindSessionCallbacks(s: TerminalSession): void {
+    s.onStateChanged = () => {
+      // Keep exited sessions visible until the user closes them so the
+      // "会话已退出" state remains truthful and recoverable.
+      this.sessions = [...this.sessions];
+      if (s.uid === this.splitSessionUid && !s.alive && s.nativeStartCompleted &&
+        !s.startInProgress) {
+        this.splitSessionUid = -1;
+        this.splitPaneSession = null;
+        this.splitPaneCwd = '';
+        this.splitFocused = false;
+        this.terminalFocusRequest++;
+        setTimeout(() => {
+          if (this.mgr.sessions.some((session: TerminalSession) => session.uid === s.uid)) {
+            this.closeSession(s);
+          }
+        }, 0);
+      }
+    };
+    s.onMetadataChanged = () => { this.saveSessionsSoon(); };
+    s.onCwdChanged = () => {
+      this.sessions = [...this.sessions];
+      if (s.uid === this.splitSessionUid) {
+        this.splitPaneCwd = s.cwd;
+      }
+      this.saveSessionsSoon();
+    };
   }
 
   private closeSession(s: TerminalSession): void {
@@ -1416,13 +1511,23 @@ struct Index {
     }
     const selected = this.currentSession();
     const selectedUid = selected === null ? -1 : selected.uid;
+    const promotedUid = selectedUid === s.uid && this.splitSessionUid > 0 &&
+      this.splitSessionUid !== s.uid ? this.splitSessionUid : -1;
+    if (s.uid === this.splitSessionUid || promotedUid > 0) {
+      this.splitSessionUid = -1;
+      this.splitPaneSession = null;
+      this.splitPaneCwd = '';
+      this.terminalFocusRequest++;
+    }
     this.mgr.remove(s);
-    this.notificationStates.delete(s.uid);
     SessionNotificationService.cancelSession(s.uid);
     this.sessions = [...this.mgr.sessions];
     this.renderedSessionUids = this.renderedSessionUids.filter((uid: number) => uid !== s.uid);
     if (this.sessions.length === 0) {
       this.currentIdx = -1;
+    } else if (promotedUid > 0) {
+      const promotedIndex = this.sessions.findIndex((item: TerminalSession) => item.uid === promotedUid);
+      this.currentIdx = promotedIndex >= 0 ? promotedIndex : Math.min(closingIndex, this.sessions.length - 1);
     } else if (selectedUid >= 0 && selectedUid !== s.uid) {
       const preservedIndex = this.sessions.findIndex((item: TerminalSession) => item.uid === selectedUid);
       if (preservedIndex >= 0) {
@@ -1495,6 +1600,29 @@ struct Index {
   private showSidebar(): void {
     this.getUIContext().animateTo({ duration: 200, curve: Curve.EaseOut },
       () => { this.sidebarCollapsed = false; });
+  }
+
+  /**
+   * Flex weights expressed in measured vp values keep the title divider at
+   * the same x-coordinate as the terminal divider. The system title-button
+   * inset belongs inside the trailing title segment; removing it from the
+   * parent width would shift the divider left and break alignment.
+   */
+  private sharedTitlePrimaryWeight(): number {
+    const flexibleWidth = this.workspaceWidth - 1;
+    if (flexibleWidth <= 2) {
+      return this.splitRatio;
+    }
+    const target = this.workspaceWidth * this.splitRatio;
+    return Math.max(1, Math.min(flexibleWidth - 1, target));
+  }
+
+  private sharedTitleSecondaryWeight(): number {
+    const flexibleWidth = this.workspaceWidth - 1;
+    if (flexibleWidth <= 2) {
+      return 1 - this.splitRatio;
+    }
+    return Math.max(1, flexibleWidth - this.sharedTitlePrimaryWeight());
   }
 
   @Builder
@@ -1571,7 +1699,9 @@ struct Index {
             .fontColor(Theme.text(this.isDark))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .constraintSize({ maxWidth: 360 })
+            .constraintSize({
+              maxWidth: this.splitPaneSession === null || this.splitHorizontal ? 360 : 220
+            })
             .margin({ left: 7 })
           SessionNumberBadge({ value: this.currentSession()!.sequence, isDark: this.isDark })
             .margin({ left: 6 })
@@ -1581,7 +1711,9 @@ struct Index {
             .fontColor(Theme.tertiary(this.isDark))
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .constraintSize({ maxWidth: 260 })
+            .constraintSize({
+              maxWidth: this.splitPaneSession === null || this.splitHorizontal ? 260 : 160
+            })
         } else {
           UiIcon({ name: IconName.Terminal, iconSize: 14, color: Theme.tertiary(this.isDark) })
           Text('可新建会话')
@@ -1593,17 +1725,75 @@ struct Index {
         }
       }
       .height('100%')
-      .layoutWeight(1)
-      .padding({ left: this.sidebarCollapsed ? 6 : 16, right: 10 })
+      .layoutWeight(this.splitPaneSession !== null && !this.splitHorizontal ?
+        this.sharedTitlePrimaryWeight() : 1)
+      .padding({
+        left: this.sidebarCollapsed ? 6 : 16,
+        right: this.splitPaneSession !== null && !this.splitHorizontal ? 10 :
+          this.titleButtonInset + 10
+      })
       .focusable(true)
       .focusOnTouch(true)
       .onTouch((event: TouchEvent) => {
         this.handleTitleTouch(event);
       })
+
+      // Left/right panes share the application title bar. A top/bottom split
+      // gives the lower pane its own local title because it is not adjacent to
+      // the application title bar.
+      if (this.splitPaneSession !== null && !this.splitHorizontal) {
+        Divider()
+          .vertical(true)
+          .height(20)
+          .strokeWidth(1)
+          .color(Theme.divider(this.isDark))
+
+        Row() {
+          Text('分屏')
+            .fontSize(10)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(Theme.accent(this.isDark))
+            .height(19)
+            .padding({ left: 6, right: 6 })
+            .backgroundColor(Theme.accentWash(this.isDark))
+            .borderRadius(6)
+          UiIcon({
+            name: IconName.Terminal,
+            iconSize: 13,
+            color: this.splitFocused ? Theme.accent(this.isDark) : Theme.tertiary(this.isDark)
+          })
+            .margin({ left: 8 })
+          Text(this.programLabel(this.splitPaneSession!))
+            .fontSize(13)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(Theme.text(this.isDark))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .constraintSize({ maxWidth: 120 })
+            .margin({ left: 6 })
+          Blank()
+          Text(this.displayCwd(this.splitPaneCwd))
+            .fontSize(12)
+            .fontColor(Theme.tertiary(this.isDark))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .constraintSize({ maxWidth: 180 })
+        }
+        .height('100%')
+        .layoutWeight(this.sharedTitleSecondaryWeight())
+        .padding({ left: 10, right: this.titleButtonInset + 10 })
+        .focusable(true)
+        .focusOnTouch(true)
+        .onTouch((event: TouchEvent) => {
+          this.handleTitleTouch(event);
+        })
+        .accessibilityGroup(true)
+        .accessibilityText('分屏，程序 ' + this.programLabel(this.splitPaneSession!) +
+          '，空间 ' + this.displayCwd(this.splitPaneCwd))
+      }
     }
     .width('100%')
     .height(40)
-    .padding({ right: this.titleButtonInset })
     .backgroundColor(Theme.windowBg(this.isDark))
   }
 
@@ -1668,7 +1858,11 @@ struct Index {
     .width(420)
   }
 
-  private handleAppShortcut(keyCode: number, shift: boolean): void {
+  private handleAppShortcut(keyCode: number, shift: boolean, alt: boolean = false): void {
+    // Ctrl+Alt+... combinations are reserved: only the split toggle uses one.
+    if (alt && keyCode !== KEYCODE_D) {
+      return;
+    }
     switch (keyCode) {
       case KEYCODE_K:
         this.paletteCtrl.open();
@@ -1676,6 +1870,11 @@ struct Index {
       case KEYCODE_B:
         this.getUIContext().animateTo({ duration: 200, curve: Curve.EaseOut },
           () => { this.sidebarCollapsed = !this.sidebarCollapsed; });
+        break;
+      case KEYCODE_D:
+        if (alt) {
+          this.openSplit(shift);
+        }
         break;
       case KEYCODE_N:
         if (shift) {
@@ -1688,13 +1887,235 @@ struct Index {
         this.newDialogCtrl.open();
         break;
       case KEYCODE_W:
-        if (this.currentIdx >= 0 && this.currentIdx < this.sessions.length) {
+        if (this.splitSession() !== null && this.splitFocused) {
+          this.closeSplit();
+        } else if (this.currentIdx >= 0 && this.currentIdx < this.sessions.length) {
           this.closeSession(this.sessions[this.currentIdx]);
         }
         break;
       default:
         break;
     }
+  }
+
+  @Builder
+  primaryTerminalPane() {
+    Stack() {
+      ForEach(this.primaryPaneSessions, (s: TerminalSession) => {
+        Column() {
+          TerminalView({
+            session: s,
+            active: this.isCurrentSession(s),
+            focusEligible: !this.splitFocused,
+            focusRequest: this.terminalFocusRequest,
+            layoutRefreshRequest: this.terminalLayoutRefreshRequest,
+            onViewFocus: (uid: number) => { this.onPaneFocused(uid); },
+            onCloseSession: (uid: number) => {
+              const target = this.sessions.find((item: TerminalSession) => item.uid === uid);
+              if (target !== undefined) this.closeSession(target);
+            },
+            onShortcut: (keyCode: number, shift: boolean, alt: boolean) => {
+              this.handleAppShortcut(keyCode, shift, alt);
+            }
+          })
+        }
+        .width('100%')
+        .height('100%')
+        .padding({ left: 10, right: 10, top: 8, bottom: 8 })
+        .visibility(this.isCurrentSession(s) ? Visibility.Visible : Visibility.Hidden)
+      }, (s: TerminalSession) => 'term_' + s.uid.toString())
+
+      if (this.sessions.length === 0) {
+        Column() {
+          this.emptyState()
+        }
+        .width('100%')
+        .height('100%')
+        .justifyContent(FlexAlign.Center)
+        .backgroundColor(Theme.terminalBg(this.isDark))
+      }
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor(Theme.terminalBg(this.isDark))
+  }
+
+  @Builder
+  splitTerminalPane(session: TerminalSession) {
+    Column() {
+      if (this.splitHorizontal) {
+        Row() {
+          Text('分屏')
+            .fontSize(10)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(Theme.accent(this.isDark))
+            .height(19)
+            .padding({ left: 6, right: 6 })
+            .backgroundColor(Theme.accentWash(this.isDark))
+            .borderRadius(6)
+          UiIcon({
+            name: IconName.Terminal,
+            iconSize: 13,
+            color: this.splitFocused ? Theme.accent(this.isDark) : Theme.tertiary(this.isDark)
+          })
+            .margin({ left: 8 })
+          Text(this.programLabel(session))
+            .fontSize(13)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(Theme.text(this.isDark))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .constraintSize({ maxWidth: 160 })
+            .margin({ left: 6 })
+          Blank()
+          Text(this.displayCwd(this.splitPaneCwd))
+            .fontSize(12)
+            .fontColor(Theme.tertiary(this.isDark))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .constraintSize({ maxWidth: 260 })
+        }
+        .width('100%')
+        .height(30)
+        .padding({ left: 10, right: 10 })
+        .backgroundColor(Theme.windowBg(this.isDark))
+        .accessibilityGroup(true)
+        .accessibilityText('分屏，程序 ' + this.programLabel(session) +
+          '，空间 ' + this.displayCwd(this.splitPaneCwd))
+      }
+
+      TerminalView({
+        session: session,
+        active: true,
+        focusEligible: this.splitFocused,
+        focusRequest: this.terminalFocusRequest,
+        layoutRefreshRequest: this.terminalLayoutRefreshRequest,
+        onViewFocus: (uid: number) => { this.onPaneFocused(uid); },
+        onCloseSession: (uid: number) => {
+          const target = this.sessions.find((item: TerminalSession) => item.uid === uid);
+          if (target !== undefined) this.closeSession(target);
+        },
+        onShortcut: (keyCode: number, shift: boolean, alt: boolean) => {
+          this.handleAppShortcut(keyCode, shift, alt);
+        }
+      })
+        .width('100%')
+        .layoutWeight(1)
+        .padding({ left: 10, right: 10, top: 8, bottom: 8 })
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor(Theme.terminalBg(this.isDark))
+  }
+
+  @Builder
+  splitDivider() {
+    if (this.splitHorizontal) {
+      Column()
+        .width('100%')
+        .height(3)
+        .backgroundColor(this.splitDividerHovered || this.splitDragging ?
+          Theme.accent(this.isDark) : Theme.divider(this.isDark))
+        .onHover((isHover: boolean) => {
+          this.splitDividerHovered = isHover;
+          if (isHover) {
+            cursorControl.setCursor(pointer.PointerStyle.NORTH_SOUTH);
+          } else {
+            cursorControl.restoreDefault();
+          }
+        })
+        .onMouse((event: MouseEvent) => {
+          if (event.button !== MouseButton.Left) return;
+          if (event.action === MouseAction.Press) {
+            this.splitDragging = true;
+            this.splitDragStartY = event.windowY;
+            this.splitDragStartRatio = this.splitRatio;
+          } else if (event.action === MouseAction.Move && this.splitDragging) {
+            const delta = event.windowY - this.splitDragStartY;
+            if (this.workspaceHeight > 0) {
+              this.splitRatio = Math.min(0.8,
+                Math.max(0.2, this.splitDragStartRatio + delta / this.workspaceHeight));
+            }
+          } else if (event.action === MouseAction.Release) {
+            this.splitDragging = false;
+          }
+        })
+    } else {
+      Column()
+        .width(3)
+        .height('100%')
+        .backgroundColor(this.splitDividerHovered || this.splitDragging ?
+          Theme.accent(this.isDark) : Theme.divider(this.isDark))
+        .onHover((isHover: boolean) => {
+          this.splitDividerHovered = isHover;
+          if (isHover) {
+            cursorControl.setCursor(pointer.PointerStyle.WEST_EAST);
+          } else {
+            cursorControl.restoreDefault();
+          }
+        })
+        .onMouse((event: MouseEvent) => {
+          if (event.button !== MouseButton.Left) return;
+          if (event.action === MouseAction.Press) {
+            this.splitDragging = true;
+            this.splitDragStartX = event.windowX;
+            this.splitDragStartRatio = this.splitRatio;
+          } else if (event.action === MouseAction.Move && this.splitDragging) {
+            const delta = event.windowX - this.splitDragStartX;
+            if (this.workspaceWidth > 0) {
+              this.splitRatio = Math.min(0.8,
+                Math.max(0.2, this.splitDragStartRatio + delta / this.workspaceWidth));
+            }
+          } else if (event.action === MouseAction.Release) {
+            this.splitDragging = false;
+          }
+        })
+    }
+  }
+
+  @Builder
+  terminalWorkspace() {
+    Column() {
+      if (this.splitPaneSession !== null) {
+        if (this.splitHorizontal) {
+          Column() {
+            this.primaryTerminalPane()
+          }
+          .width('100%')
+          .height((this.splitRatio * 100).toString() + '%')
+          this.splitDivider()
+          Column() {
+            this.splitTerminalPane(this.splitPaneSession!)
+          }
+          .width('100%')
+          .layoutWeight(1)
+        } else {
+          Row() {
+            Column() {
+              this.primaryTerminalPane()
+            }
+            .height('100%')
+            .width((this.splitRatio * 100).toString() + '%')
+            this.splitDivider()
+            Column() {
+              this.splitTerminalPane(this.splitPaneSession!)
+            }
+            .height('100%')
+            .layoutWeight(1)
+          }
+          .width('100%')
+          .height('100%')
+        }
+      } else {
+        this.primaryTerminalPane()
+      }
+    }
+    .width('100%')
+    .height('100%')
+    .onAreaChange((oldValue: Area, newValue: Area) => {
+      this.workspaceWidth = newValue.width as number;
+      this.workspaceHeight = newValue.height as number;
+    })
   }
 
   build() {
@@ -1706,6 +2127,7 @@ struct Index {
           sidebarWidth: this.sidebarWidth,
           sessions: $sessions,
           currentId: $currentIdx,
+          splitSessionUid: this.splitSessionUid,
           onNewAgent: () => { this.newDialogCtrl.open(); },
           onNewAgentIn: (cwd: string, deviceId: string) => {
             this.selectDevice(deviceId);
@@ -1739,11 +2161,19 @@ struct Index {
           },
           onNewSpace: () => { this.newSpaceCtrl.open(); },
           onSearch: () => { this.paletteCtrl.open(); },
+          onSplit: () => { this.openSplit(false); },
           onCloseSession: (s: TerminalSession) => this.closeSession(s),
           onSelectSession: (uid: number) => {
+            if (uid === this.splitSessionUid) {
+              // Keep the split arrangement; just hand the pane focus.
+              this.splitFocused = true;
+              this.terminalFocusRequest++;
+              return;
+            }
             const idx = this.sessions.findIndex((it: TerminalSession) => it.uid === uid);
             if (idx >= 0) {
               this.currentIdx = idx;
+              this.splitFocused = false;
             }
           },
           onRenameSession: (s: TerminalSession, name: string) => {
@@ -1769,35 +2199,8 @@ struct Index {
             .color(Theme.divider(this.isDark))
             .strokeWidth(1)
 
-          // Terminal stack: all sessions mounted, only current visible.
-          Stack() {
-            ForEach(this.renderedSessions(), (s: TerminalSession) => {
-              Column() {
-                TerminalView({
-                  session: s,
-                  active: this.isCurrentSession(s),
-                  onEvent: (ev: SessionEvent) => this.mgr.dispatch(ev),
-                  onShortcut: (keyCode: number, shift: boolean) => {
-                    this.handleAppShortcut(keyCode, shift);
-                  }
-                })
-              }
-              .width('100%')
-              .height('100%')
-              .padding({ left: 10, right: 10, top: 8, bottom: 8 })
-              .visibility(this.isCurrentSession(s) ? Visibility.Visible : Visibility.Hidden)
-            }, (s: TerminalSession) => 'term_' + s.uid.toString())
-
-            if (this.sessions.length === 0) {
-              Column() {
-                this.emptyState()
-              }
-              .width('100%')
-              .height('100%')
-              .justifyContent(FlexAlign.Center)
-              .backgroundColor(Theme.terminalBg(this.isDark))
-            }
-
+          Column() {
+            this.terminalWorkspace()
           }
           .width('100%')
           .layoutWeight(1)
@@ -1831,11 +2234,15 @@ struct Index {
         this.shiftDown = (event.type === KeyType.Down);
         return;
       }
+      if (event.keyCode === KEYCODE_ALT_LEFT || event.keyCode === KEYCODE_ALT_RIGHT) {
+        this.altDown = (event.type === KeyType.Down);
+        return;
+      }
       if (event.type !== KeyType.Down) return;
       if (!this.ctrlDown) {
         return;
       }
-      this.handleAppShortcut(event.keyCode, this.shiftDown);
+      this.handleAppShortcut(event.keyCode, this.shiftDown, this.altDown);
     })
   }
 }

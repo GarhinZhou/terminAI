@@ -1,15 +1,68 @@
 import { notificationManager } from '@kit.NotificationKit';
-import { wantAgent, Want, WantAgent } from '@kit.AbilityKit';
+import { common, wantAgent, Want, WantAgent } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { AgentRunState, TerminalSession } from './TerminalSession';
+import { APP_BUNDLE_NAME, ENTRY_ABILITY_NAME } from '../common/AppIdentity';
+import { TerminaiPreferences } from './TerminaiPreferences';
 
-const APP_BUNDLE_NAME = 'org.demo.myapplication';
-const ENTRY_ABILITY_NAME = 'EntryAbility';
 const SESSION_NOTIFICATION_ID_BASE = 100000;
 const TEST_NOTIFICATION_ID = 99999;
+const PREF_NOTIFY_ENABLED = 'notifyEnabled';
+const PREF_NOTIFICATION_PERMISSION_ASKED = 'notificationPermissionAsked';
 
 /** Local notifications for agent attention states. */
 export class SessionNotificationService {
+  private static initialPermissionRequesting: boolean = false;
+
+  static prepareInitialPermission(context: common.Context): boolean {
+    let needed = true;
+    try {
+      const store = TerminaiPreferences.get(context);
+      const askedValue = store.getSync(PREF_NOTIFICATION_PERMISSION_ASKED, false);
+      needed = typeof askedValue === 'boolean' ? !askedValue : true;
+    } catch (error) {
+      console.error('TERMINAI load initial notification permission state failed: ' +
+        JSON.stringify(error));
+    }
+    AppStorage.setOrCreate('notificationPermissionPromptPending', needed);
+    return needed;
+  }
+
+  static async requestInitialPermission(context: common.UIAbilityContext): Promise<void> {
+    if (SessionNotificationService.initialPermissionRequesting) {
+      return;
+    }
+    SessionNotificationService.initialPermissionRequesting = true;
+    try {
+      const store = TerminaiPreferences.get(context);
+      const askedValue = store.getSync(PREF_NOTIFICATION_PERMISSION_ASKED, false);
+      if (typeof askedValue === 'boolean' && askedValue) {
+        return;
+      }
+      const enabledBefore = await notificationManager.isNotificationEnabled();
+      if (enabledBefore) {
+        store.putSync(PREF_NOTIFICATION_PERMISSION_ASKED, true);
+        store.flushSync();
+        return;
+      }
+      try {
+        await notificationManager.requestEnableNotification(context);
+      } catch (error) {
+        console.info('TERMINAI initial notification permission not granted: ' + JSON.stringify(error));
+      }
+      const enabledAfter = await notificationManager.isNotificationEnabled();
+      store.putSync(PREF_NOTIFICATION_PERMISSION_ASKED, true);
+      store.putSync(PREF_NOTIFY_ENABLED, enabledAfter);
+      store.flushSync();
+      AppStorage.setOrCreate('notifyEnabled', enabledAfter);
+    } catch (error) {
+      console.error('TERMINAI request initial notification permission failed: ' + JSON.stringify(error));
+    } finally {
+      SessionNotificationService.initialPermissionRequesting = false;
+      AppStorage.setOrCreate('notificationPermissionPromptPending', false);
+    }
+  }
+
   static notificationId(sessionUid: number): number {
     return SESSION_NOTIFICATION_ID_BASE + sessionUid;
   }

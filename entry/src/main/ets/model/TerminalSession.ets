@@ -1,8 +1,11 @@
 // Data model for one PTY terminal session.
 import libterminal from 'libterminal.so';
 
-const OUTPUT_HISTORY_LIMIT = 2 * 1024 * 1024;
+const OUTPUT_HISTORY_MAX_LIMIT = 2 * 1024 * 1024;
+const OUTPUT_HISTORY_MIN_LIMIT = 64 * 1024;
+const OUTPUT_HISTORY_GLOBAL_BUDGET = 12 * 1024 * 1024;
 const OUTPUT_HISTORY_CHUNK_LIMIT = 64 * 1024;
+const OUTPUT_CHECKPOINT_MAX_LIMIT = 512 * 1024;
 
 export interface SessionEvent {
   id: number;
@@ -30,6 +33,46 @@ export enum AgentRunState {
   Unknown = '状态未知'
 }
 
+/** Renderer-independent lifecycle of the native PTY owned by one logical session. */
+export enum SessionRuntimePhase {
+  Created = 'created',
+  Starting = 'starting',
+  Running = 'running',
+  Exited = 'exited',
+  Failed = 'failed',
+  Disposed = 'disposed'
+}
+
+export enum NativeStartDisposition {
+  Accepted = 0,
+  AlreadyExited = 1,
+  Stale = 2
+}
+
+/** Immutable diagnostics for routing assertions and future in-app support bundles. */
+export class SessionRuntimeSnapshot {
+  uid: number;
+  nativeId: number;
+  generation: number;
+  phase: SessionRuntimePhase;
+  alive: boolean;
+  outputCursor: number;
+  droppedNativeEvents: number;
+  lastNativeEventAt: number;
+
+  constructor(uid: number, nativeId: number, generation: number, phase: SessionRuntimePhase,
+    alive: boolean, outputCursor: number, droppedNativeEvents: number, lastNativeEventAt: number) {
+    this.uid = uid;
+    this.nativeId = nativeId;
+    this.generation = generation;
+    this.phase = phase;
+    this.alive = alive;
+    this.outputCursor = outputCursor;
+    this.droppedNativeEvents = droppedNativeEvents;
+    this.lastNativeEventAt = lastNativeEventAt;
+  }
+}
+
 /** One bounded slice from the session-owned output ring. */
 export class TerminalOutputSlice {
   startCursor: number;
@@ -55,6 +98,26 @@ export class TerminalOutputSnapshot {
     this.startCursor = startCursor;
     this.endCursor = endCursor;
     this.data = data;
+  }
+}
+
+class TerminalOutputObserver {
+  id: number;
+  callback: (data: string) => void;
+
+  constructor(id: number, callback: (data: string) => void) {
+    this.id = id;
+    this.callback = callback;
+  }
+}
+
+class TerminalStateObserver {
+  id: number;
+  callback: () => void;
+
+  constructor(id: number, callback: () => void) {
+    this.id = id;
+    this.callback = callback;
   }
 }
 
@@ -112,6 +175,8 @@ export class TerminalSession {
   private outputHistoryChunks: string[] = [];
   private outputHistoryLength: number = 0;
   private outputHistoryTruncated: boolean = false;
+  /** Dynamic per-session share of the process-wide history budget. */
+  private outputHistoryLimit: number = OUTPUT_HISTORY_MAX_LIMIT;
   /** Absolute cursor of outputHistoryChunks[0]; only moves forward when old output is trimmed. */
   private outputHistoryStartCursor: number = 0;
   /** xterm SerializeAddon checkpoint, captured only after the active renderer becomes quiet. */
@@ -122,16 +187,29 @@ export class TerminalSession {
   startInProgress: boolean = false;
   nativeStartCompleted: boolean = false;
   disposed: boolean = false;
+  /** Every native start attempt owns one generation; callbacks from older attempts are rejected. */
+  runtimeGeneration: number = 0;
+  runtimePhase: SessionRuntimePhase = SessionRuntimePhase.Created;
+  nativeStartedAt: number = 0;
+  nativeExitedAt: number = 0;
+  lastNativeEventAt: number = 0;
+  droppedNativeEvents: number = 0;
   /** Explicit sidebar renames take precedence over agent-provided terminal titles. */
   manualTitle: boolean = false;
   /** TerminalView → Index: called when this session wants attention. */
   onStateChanged: () => void = () => {};
   /** Persisted metadata changed (title, cwd, etc.); activity-only changes do not use this callback. */
   onMetadataChanged: () => void = () => {};
-  /** TerminalView → native bridge callbacks, wired by TerminalView. */
-  onOutput: (data: string) => void = () => {};
+  /** Process lifecycle changed independently of the current ArkUI renderer. */
+  onRuntimeChanged: () => void = () => {};
+  /** Multiple renderer clients may observe one PTY without stealing each other's callback. */
+  private outputObserverCounter: number = 0;
+  private outputObservers: TerminalOutputObserver[] = [];
+  /** Process services observe state independently from the replaceable ArkUI page. */
+  private stateObserverCounter: number = 0;
+  private stateObservers: TerminalStateObserver[] = [];
   /** Native TSFN events are owned by the session, never by an evictable ArkWeb view. */
-  onNativeEvent: (event: SessionEvent) => void = () => {};
+  onNativeEvent: (generation: number, event: SessionEvent) => void = () => {};
   /** Called when the shell's working directory changes. */
   onCwdChanged: (cwd: string) => void = () => {};
   /** Last native process inspection start; keeps background scans adaptive and staggered. */
@@ -198,7 +276,7 @@ export class TerminalSession {
     }
     if (this.name !== title) {
       this.name = title;
-      this.onStateChanged();
+      this.notifyStateChanged();
       this.onMetadataChanged();
     }
   }
@@ -250,6 +328,56 @@ export class TerminalSession {
     }
   }
 
+  private trimOutputHistory(): void {
+    let historyTrimmed = false;
+    while (this.outputHistoryLength > this.outputHistoryLimit &&
+      this.outputHistoryChunks.length > 1) {
+      const removed = this.outputHistoryChunks[0];
+      this.outputHistoryChunks.splice(0, 1);
+      this.outputHistoryLength -= removed.length;
+      this.outputHistoryStartCursor += removed.length;
+      historyTrimmed = true;
+    }
+    if (this.outputHistoryLength > this.outputHistoryLimit &&
+      this.outputHistoryChunks.length === 1) {
+      const only = this.outputHistoryChunks[0];
+      const removedLength = only.length - this.outputHistoryLimit;
+      this.outputHistoryChunks[0] = only.substring(removedLength);
+      this.outputHistoryLength = this.outputHistoryChunks[0].length;
+      this.outputHistoryStartCursor += removedLength;
+      historyTrimmed = true;
+    }
+    if (historyTrimmed) {
+      this.outputHistoryTruncated = true;
+      // Start a recovery replay at a complete output line instead of in the
+      // middle of a CSI/OSC sequence or a UTF-16 surrogate pair.
+      if (this.outputHistoryChunks.length > 0) {
+        const first = this.outputHistoryChunks[0];
+        const lineBoundary = first.indexOf('\n');
+        if (lineBoundary >= 0 && lineBoundary < 8192) {
+          const removedLength = lineBoundary + 1;
+          this.outputHistoryChunks[0] = first.substring(removedLength);
+          this.outputHistoryLength -= removedLength;
+          this.outputHistoryStartCursor += removedLength;
+        }
+      }
+    }
+    const checkpointLimit = Math.min(OUTPUT_CHECKPOINT_MAX_LIMIT,
+      Math.max(OUTPUT_HISTORY_MIN_LIMIT, Math.floor(this.outputHistoryLimit / 2)));
+    if (this.outputCheckpointCursor < this.outputHistoryStartCursor ||
+      this.outputCheckpoint.length > checkpointLimit) {
+      this.outputCheckpoint = '';
+      this.outputCheckpointCursor = -1;
+    }
+  }
+
+  /** Rebalance this session without ever allowing one terminal to dominate process memory. */
+  setOutputHistoryLimit(limit: number): void {
+    this.outputHistoryLimit = Math.max(OUTPUT_HISTORY_MIN_LIMIT,
+      Math.min(OUTPUT_HISTORY_MAX_LIMIT, Math.floor(limit)));
+    this.trimOutputHistory();
+  }
+
   private appendOutputHistory(data: string): void {
     if (data.length === 0) {
       return;
@@ -262,37 +390,7 @@ export class TerminalSession {
       this.outputHistoryChunks.push(data);
     }
     this.outputHistoryLength += data.length;
-    let historyTrimmed = false;
-    while (this.outputHistoryLength > OUTPUT_HISTORY_LIMIT &&
-      this.outputHistoryChunks.length > 1) {
-      const removed = this.outputHistoryChunks[0];
-      this.outputHistoryChunks.splice(0, 1);
-      this.outputHistoryLength -= removed.length;
-      this.outputHistoryStartCursor += removed.length;
-      historyTrimmed = true;
-    }
-    if (this.outputHistoryLength > OUTPUT_HISTORY_LIMIT &&
-      this.outputHistoryChunks.length === 1) {
-      const only = this.outputHistoryChunks[0];
-      const removedLength = only.length - OUTPUT_HISTORY_LIMIT;
-      this.outputHistoryChunks[0] = only.substring(removedLength);
-      this.outputHistoryLength = this.outputHistoryChunks[0].length;
-      this.outputHistoryStartCursor += removedLength;
-      historyTrimmed = true;
-    }
-    if (historyTrimmed) {
-      this.outputHistoryTruncated = true;
-      // Start a recovery replay at a complete output line instead of in the
-      // middle of a CSI/OSC sequence or a UTF-16 surrogate pair.
-      const first = this.outputHistoryChunks[0];
-      const lineBoundary = first.indexOf('\n');
-      if (lineBoundary >= 0 && lineBoundary < 8192) {
-        const removedLength = lineBoundary + 1;
-        this.outputHistoryChunks[0] = first.substring(removedLength);
-        this.outputHistoryLength -= removedLength;
-        this.outputHistoryStartCursor += removedLength;
-      }
-    }
+    this.trimOutputHistory();
     this.outputVersion++;
   }
 
@@ -314,6 +412,79 @@ export class TerminalSession {
 
   outputCursor(): number {
     return this.outputHistoryStartCursor + this.outputHistoryLength;
+  }
+
+  runtimeSnapshot(): SessionRuntimeSnapshot {
+    return new SessionRuntimeSnapshot(this.uid, this.id, this.runtimeGeneration,
+      this.runtimePhase, this.alive, this.outputCursor(), this.droppedNativeEvents,
+      this.lastNativeEventAt);
+  }
+
+  subscribeOutput(callback: (data: string) => void): number {
+    this.outputObserverCounter++;
+    const observer = new TerminalOutputObserver(this.outputObserverCounter, callback);
+    this.outputObservers.push(observer);
+    return observer.id;
+  }
+
+  subscribeState(callback: () => void): number {
+    this.stateObserverCounter++;
+    const observer = new TerminalStateObserver(this.stateObserverCounter, callback);
+    this.stateObservers.push(observer);
+    return observer.id;
+  }
+
+  markUnread(value: boolean): void {
+    if (this.unread === value) {
+      return;
+    }
+    this.unread = value;
+    this.notifyStateChanged();
+  }
+
+  unsubscribeState(observerId: number): void {
+    if (observerId <= 0) {
+      return;
+    }
+    const index = this.stateObservers.findIndex((observer: TerminalStateObserver) =>
+      observer.id === observerId);
+    if (index >= 0) {
+      this.stateObservers.splice(index, 1);
+    }
+  }
+
+  private notifyStateChanged(): void {
+    this.onStateChanged();
+    const observers = this.stateObservers.slice();
+    for (const observer of observers) {
+      try {
+        observer.callback();
+      } catch (error) {
+        console.error('TERMINAI terminal state observer failed: ' + JSON.stringify(error));
+      }
+    }
+  }
+
+  unsubscribeOutput(observerId: number): void {
+    if (observerId <= 0) {
+      return;
+    }
+    const index = this.outputObservers.findIndex((observer: TerminalOutputObserver) =>
+      observer.id === observerId);
+    if (index >= 0) {
+      this.outputObservers.splice(index, 1);
+    }
+  }
+
+  private emitOutput(data: string): void {
+    const observers = this.outputObservers.slice();
+    for (const observer of observers) {
+      try {
+        observer.callback(data);
+      } catch (error) {
+        console.error('TERMINAI terminal output observer failed: ' + JSON.stringify(error));
+      }
+    }
   }
 
   /**
@@ -369,7 +540,9 @@ export class TerminalSession {
   recordOutputCheckpoint(cursor: number, data: string): void {
     // MessagePort traffic and session memory remain bounded even when the user
     // configures an extremely large xterm scrollback value.
-    if (data.length === 0 || data.length > 1024 * 1024 ||
+    const checkpointLimit = Math.min(OUTPUT_CHECKPOINT_MAX_LIMIT,
+      Math.max(OUTPUT_HISTORY_MIN_LIMIT, Math.floor(this.outputHistoryLimit / 2)));
+    if (data.length === 0 || data.length > checkpointLimit ||
       cursor < this.outputHistoryStartCursor || cursor > this.outputCursor() ||
       cursor < this.outputCheckpointCursor) {
       return;
@@ -378,12 +551,152 @@ export class TerminalSession {
     this.outputCheckpoint = data;
   }
 
+  /** Atomically reserves a start generation so two ArkWeb views cannot spawn the same session. */
+  beginNativeStart(): number {
+    if (this.disposed || this.id > 0 || this.startInProgress || this.nativeStartCompleted) {
+      return 0;
+    }
+    this.runtimeGeneration++;
+    this.runtimePhase = SessionRuntimePhase.Starting;
+    this.startInProgress = true;
+    this.nativeStartedAt = Date.now();
+    this.nativeExitedAt = 0;
+    this.onRuntimeChanged();
+    return this.runtimeGeneration;
+  }
+
+  isCurrentStart(generation: number): boolean {
+    return !this.disposed && generation > 0 && generation === this.runtimeGeneration;
+  }
+
+  /** Completes a createSession call that may already have delivered early output/exit events. */
+  completeNativeStart(generation: number, nativeId: number): NativeStartDisposition {
+    if (!this.isCurrentStart(generation)) {
+      return NativeStartDisposition.Stale;
+    }
+    if (this.runtimePhase === SessionRuntimePhase.Exited) {
+      this.startInProgress = false;
+      this.nativeStartCompleted = true;
+      return NativeStartDisposition.AlreadyExited;
+    }
+    if (this.id > 0 && this.id !== nativeId) {
+      this.droppedNativeEvents++;
+      return NativeStartDisposition.Stale;
+    }
+    this.id = nativeId;
+    this.alive = true;
+    this.startInProgress = false;
+    this.nativeStartCompleted = true;
+    this.runtimePhase = SessionRuntimePhase.Running;
+    this.onRuntimeChanged();
+    return NativeStartDisposition.Accepted;
+  }
+
+  /** Validate generation and native id before any PTY event is allowed to mutate this session. */
+  acceptNativeEvent(generation: number, event: SessionEvent): boolean {
+    if (!this.isCurrentStart(generation) || event.id <= 0 ||
+      this.runtimePhase === SessionRuntimePhase.Failed ||
+      this.runtimePhase === SessionRuntimePhase.Disposed) {
+      this.droppedNativeEvents++;
+      return false;
+    }
+    if (this.id <= 0 && this.runtimePhase === SessionRuntimePhase.Starting) {
+      // Native reader threads can publish output before createSession returns.
+      this.id = event.id;
+    }
+    if (this.id !== event.id) {
+      this.droppedNativeEvents++;
+      return false;
+    }
+    this.lastNativeEventAt = Date.now();
+    if (event.kind === 'exit') {
+      this.runtimePhase = SessionRuntimePhase.Exited;
+      this.nativeExitedAt = this.lastNativeEventAt;
+      this.startInProgress = false;
+      this.nativeStartCompleted = true;
+    } else if (this.runtimePhase === SessionRuntimePhase.Starting) {
+      this.runtimePhase = SessionRuntimePhase.Running;
+      this.alive = true;
+      this.nativeStartCompleted = true;
+    }
+    this.handleEvent(event);
+    return true;
+  }
+
+  releaseExitedNativeId(generation: number, nativeId: number): void {
+    if (generation === this.runtimeGeneration && this.id === nativeId) {
+      this.id = -1;
+      this.onRuntimeChanged();
+    }
+  }
+
+  markStartFailure(generation: number, reason: string): void {
+    if (!this.isCurrentStart(generation) || this.nativeStartCompleted) {
+      return;
+    }
+    this.startInProgress = false;
+    this.nativeStartCompleted = true;
+    this.alive = false;
+    this.exitCode = 127;
+    this.runtimePhase = SessionRuntimePhase.Failed;
+    this.nativeExitedAt = Date.now();
+    const detail = reason.trim().length > 0 ? reason.trim() : '未知错误';
+    const notice = '\r\n[terminAI] 无法启动会话：' + detail + '\r\n';
+    this.appendOutputHistory(notice);
+    this.emitOutput(notice);
+    this.activityState = this.isAgentSession() ? AgentRunState.Exited : this.activityState;
+    this.notifyStateChanged();
+    this.onRuntimeChanged();
+  }
+
+  /** Reuse the logical session and renderer while starting a fresh PTY/SSH process. */
+  prepareRestart(): boolean {
+    if (this.disposed || this.id > 0 || this.startInProgress ||
+      (this.runtimePhase !== SessionRuntimePhase.Exited &&
+      this.runtimePhase !== SessionRuntimePhase.Failed)) {
+      return false;
+    }
+    this.nativeStartCompleted = false;
+    this.alive = false;
+    this.exitCode = -1;
+    this.exitNotificationSent = false;
+    this.runtimePhase = SessionRuntimePhase.Created;
+    this.explicitReturnedShell = false;
+    this.observedAgentProcess = false;
+    this.processSignalAvailable = false;
+    this.foregroundCommand = '';
+    this.foregroundIsShell = false;
+    this.foregroundPid = -1;
+    this.recentText = '';
+    this.screenText = '';
+    this.activityState = this.isAgentSession() ? AgentRunState.Unknown : this.activityState;
+    const notice = '\r\n[terminAI] 正在重新连接会话…\r\n';
+    this.appendOutputHistory(notice);
+    this.emitOutput(notice);
+    this.notifyStateChanged();
+    this.onRuntimeChanged();
+    return true;
+  }
+
+  /** Invalidates every callback before SessionManager removes this logical session. */
+  disposeRuntime(): number {
+    const nativeId = this.id;
+    this.disposed = true;
+    this.alive = false;
+    this.startInProgress = false;
+    this.nativeStartCompleted = true;
+    this.runtimePhase = SessionRuntimePhase.Disposed;
+    this.runtimeGeneration++;
+    this.id = -1;
+    return nativeId;
+  }
+
   private setActivityState(next: AgentRunState): void {
     if (!this.isAgentSession() || this.activityState === next) {
       return;
     }
     this.activityState = next;
-    this.onStateChanged();
+    this.notifyStateChanged();
   }
 
   private stripTerminalControls(value: string): string {
@@ -394,27 +707,14 @@ export class TerminalSession {
   }
 
   private containsInputPrompt(value: string): boolean {
-    const text = value.toLowerCase();
-    return text.indexOf('waiting for input') >= 0 ||
-      text.indexOf('needs your input') >= 0 ||
-      text.indexOf('press enter') >= 0 ||
-      text.indexOf('press return') >= 0 ||
-      text.indexOf('do you want to proceed') >= 0 ||
-      text.indexOf('allow this action') >= 0 ||
-      text.indexOf('would you like to') >= 0 ||
-      text.indexOf('enter to confirm') >= 0 ||
-      text.indexOf('password:') >= 0 ||
-      text.indexOf('are you sure you want to continue connecting') >= 0 ||
-      text.indexOf('continue?') >= 0 ||
-      text.indexOf('(y/n)') >= 0 ||
-      text.indexOf('[y/n]') >= 0 ||
-      text.indexOf('是否继续') >= 0 ||
-      text.indexOf('等待输入') >= 0 ||
-      text.indexOf('请输入') >= 0 ||
-      text.indexOf('what would you like') >= 0 ||
-      text.indexOf('ask anything') >= 0 ||
-      text.indexOf('type a message') >= 0 ||
-      /(^|\n)\s*[›>] ?[^\n]*$/.test(value);
+    // Only inspect the visible tail. Matching prompt words anywhere in the
+    // transcript (for example an agent quoting credential or choice prompts)
+    // produces false notifications long after that text was printed.
+    const tail = value.slice(-1600).replace(/[ \t]+$/g, '');
+    const promptAtTail = /(waiting for input|needs your input|press (enter|return)|do you want to proceed|allow this action|would you like to|enter to confirm|what would you like|ask anything|type a message|是否继续|等待输入|请输入)[^\n]{0,180}$/i;
+    const choiceAtTail = /(continue\?|\(y\/n\)|\[y\/n\])\s*$/i;
+    return promptAtTail.test(tail) || choiceAtTail.test(tail) ||
+      /(^|\n)\s*[›>] ?[^\n]{0,220}$/.test(tail);
   }
 
   private containsTraditionalShellPrompt(value: string): boolean {
@@ -438,7 +738,7 @@ export class TerminalSession {
         if (nextCwd.length > 0 && nextCwd !== this.cwd) {
           this.cwd = nextCwd;
           this.onCwdChanged(nextCwd);
-          this.onStateChanged();
+          this.notifyStateChanged();
         }
       } else if (payload === 'terminai-agent-returned' && this.isAgentSession()) {
         this.explicitReturnedShell = true;
@@ -515,9 +815,11 @@ export class TerminalSession {
     if (!info.foregroundIsShell && info.foregroundCommand.length > 0) {
       this.observedAgentProcess = true;
     }
+    // Process inspection is advisory and can briefly miss a still-running PTY
+    // while /proc changes. Only the generation-gated native exit event owns
+    // `alive` and the Exited transition.
     if (!info.alive) {
-      this.alive = false;
-      this.setActivityState(AgentRunState.Exited);
+      this.processSignalAvailable = false;
     }
   }
 
@@ -548,7 +850,8 @@ export class TerminalSession {
     }
     // Delayed shell-prompt matching is only a fallback. Agent wrappers emit an
     // exact private marker on both local and remote sessions.
-    if (!this.processSignalAvailable && this.observedAgentProcess && quietFor >= 900 &&
+    if (this.sshTarget.length === 0 && !this.processSignalAvailable &&
+      this.observedAgentProcess && quietFor >= 900 &&
       screenStableFor >= 600 &&
       this.containsTraditionalShellPrompt(this.screenText)) {
       this.setActivityState(AgentRunState.ReturnedShell);
@@ -588,9 +891,9 @@ export class TerminalSession {
         '\r\n[terminAI] 会话异常退出（退出码 ' + ev.exitCode.toString() +
           '），请检查启动命令、工作目录或 SSH 连接。\r\n';
       this.appendOutputHistory(exitNotice);
-      this.onOutput(exitNotice);
+      this.emitOutput(exitNotice);
       this.activityState = this.isAgentSession() ? AgentRunState.Exited : this.activityState;
-      this.onStateChanged();
+      this.notifyStateChanged();
       return;
     }
     if (ev.kind === 'cwd') {
@@ -603,6 +906,7 @@ export class TerminalSession {
       if (ev.data.length > 0 && ev.data !== this.cwd) {
         this.cwd = ev.data;
         this.onCwdChanged(ev.data);
+        this.notifyStateChanged();
       }
       return;
     }
@@ -619,7 +923,7 @@ export class TerminalSession {
       if (this.isAgentSession() && plain.trim().length > 0 && !this.explicitReturnedShell) {
         this.setActivityState(AgentRunState.Outputting);
       }
-      this.onOutput(ev.data);
+      this.emitOutput(ev.data);
     }
   }
 }
@@ -647,8 +951,54 @@ export function canonicalSessionCwd(session: TerminalSession): string {
 export class SessionManager {
   sessions: TerminalSession[] = [];
   private uidCounter: number = 0;
-  /** Called from native TSFN. Must find session and dispatch. */
-  dispatch: (ev: SessionEvent) => void = () => {};
+  /** UI observers may come and go; native event ownership stays in this manager. */
+  onEvent: (session: TerminalSession, event: SessionEvent) => void = () => {};
+  onRuntimeChanged: () => void = () => {};
+  /** Backend ownership hooks; UI pages must not replace these callbacks. */
+  onSessionAdded: (session: TerminalSession) => void = () => {};
+  onSessionRemoving: (session: TerminalSession) => void = () => {};
+  /** Called by a generation-bound native callback; never capture an evictable ArkUI component. */
+  dispatchForSession(uid: number, generation: number, ev: SessionEvent): void {
+    const session = this.sessions.find((item: TerminalSession) => item.uid === uid);
+    if (session === undefined) {
+      return;
+    }
+    if (!session.acceptNativeEvent(generation, ev)) {
+      return;
+    }
+    if (ev.kind === 'exit') {
+      const deadId = ev.id;
+      session.releaseExitedNativeId(generation, deadId);
+      libterminal.killSessionAsync(deadId)
+        .catch((error: Error) => {
+          console.error('TERMINAI async exited-session cleanup failed: ' + error.message);
+        });
+      this.onRuntimeChanged();
+    }
+    this.onEvent(session, ev);
+  }
+
+  /** Compatibility route for tests and legacy native callbacks that already own a native id. */
+  dispatch: (ev: SessionEvent) => void = (ev: SessionEvent) => {
+    const session = this.sessions.find((item: TerminalSession) => item.id === ev.id);
+    if (session !== undefined) {
+      this.dispatchForSession(session.uid, session.runtimeGeneration, ev);
+    }
+  };
+
+  runtimeSnapshots(): SessionRuntimeSnapshot[] {
+    return this.sessions.map((session: TerminalSession) => session.runtimeSnapshot());
+  }
+
+  private rebalanceOutputHistoryLimits(): void {
+    if (this.sessions.length === 0) {
+      return;
+    }
+    const perSession = Math.floor(OUTPUT_HISTORY_GLOBAL_BUDGET / this.sessions.length);
+    for (const session of this.sessions) {
+      session.setOutputHistoryLimit(perSession);
+    }
+  }
 
   private nextSequence(typeKey: string, preferredSequence: number): number {
     if (preferredSequence > 0 && !this.sessions.some((item: TerminalSession) =>
@@ -692,34 +1042,44 @@ export class SessionManager {
     s.sshTarget = sshTarget;
     s.sshControlPath = sshControlPath;
     s.sshKnownHostsPath = sshKnownHostsPath;
+    s.onNativeEvent = (generation: number, event: SessionEvent) => {
+      this.dispatchForSession(s.uid, generation, event);
+    };
+    s.onRuntimeChanged = () => { this.onRuntimeChanged(); };
     this.sessions.push(s);
+    this.onSessionAdded(s);
+    this.rebalanceOutputHistoryLimits();
+    this.onRuntimeChanged();
     return s;
   }
 
   remove(s: TerminalSession): void {
-    s.disposed = true;
-    s.startInProgress = false;
-    if (s.id > 0) {
-      libterminal.killSessionAsync(s.id)
+    this.onSessionRemoving(s);
+    const nativeId = s.disposeRuntime();
+    if (nativeId > 0) {
+      libterminal.killSessionAsync(nativeId)
         .catch((error: Error) => {
           console.error('TERMINAI async session cleanup failed: ' + error.message);
         });
     }
     const idx = this.sessions.indexOf(s);
     if (idx >= 0) this.sessions.splice(idx, 1);
+    this.rebalanceOutputHistoryLimits();
+    this.onRuntimeChanged();
   }
 
   removeAll(): void {
     for (const s of this.sessions) {
-      s.disposed = true;
-      s.startInProgress = false;
-      if (s.id > 0) {
-        libterminal.killSessionAsync(s.id)
+      this.onSessionRemoving(s);
+      const nativeId = s.disposeRuntime();
+      if (nativeId > 0) {
+        libterminal.killSessionAsync(nativeId)
           .catch((error: Error) => {
             console.error('TERMINAI async session cleanup failed: ' + error.message);
           });
       }
     }
     this.sessions = [];
+    this.onRuntimeChanged();
   }
 }

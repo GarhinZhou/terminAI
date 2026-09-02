@@ -54,7 +54,7 @@
   var lastPtyResizeAt = 0;
   var PTY_RESIZE_INTERVAL = 80;
   var PTY_RESIZE_SETTLE = 130;
-  var CHECKPOINT_LIMIT = 1024 * 1024;
+  var CHECKPOINT_LIMIT = 512 * 1024;
 
   // Resize xterm's local grid in the next animation frame so the terminal
   // follows the ArkUI container in real time. ResizeObserver bursts are folded
@@ -304,19 +304,6 @@
   }
 
   // API for ArkTS -> terminal
-  window.termWrite = function (data) { writeAfterReplay(data, ''); };
-  window.termReplay = function (data) {
-    try {
-      var generation = replayGeneration + 1;
-      beginHistoryReplay(generation);
-      writeHistoryReplayChunk(generation, data);
-      endHistoryReplay(generation);
-    } catch (e) {
-      replayEndRequested = true;
-      replayPendingWrites = 0;
-      finishHistoryReplay(replayGeneration);
-    }
-  };
   // Terminal color scheme presets ("default" follows dark/light app theme).
   var SCHEMES = {
     solarized: {
@@ -369,6 +356,49 @@
   window.termClear = function () { term.clear(); };
   window.termFocus = function () { term.focus(); };
   window.termPaste = function (data) { if (data) term.paste(data); };
+  var findQuery = '';
+  var findMatchIndex = -1;
+  window.termFind = function (query, backwards) {
+    query = String(query || '');
+    if (!query) {
+      findQuery = '';
+      findMatchIndex = -1;
+      term.clearSelection();
+      return '0/0';
+    }
+    var buffer = term.buffer.active;
+    var needle = query.toLocaleLowerCase();
+    var matches = [];
+    for (var row = 0; row < buffer.length; row++) {
+      var line = buffer.getLine(row);
+      if (!line) continue;
+      var text = line.translateToString(true);
+      var lower = text.toLocaleLowerCase();
+      var from = 0;
+      while (from <= lower.length - needle.length) {
+        var column = lower.indexOf(needle, from);
+        if (column < 0) break;
+        matches.push({ row: row, column: column });
+        from = column + Math.max(needle.length, 1);
+      }
+    }
+    if (!matches.length) {
+      findQuery = query;
+      findMatchIndex = -1;
+      term.clearSelection();
+      return '0/0';
+    }
+    if (findQuery !== query || findMatchIndex < 0 || findMatchIndex >= matches.length) {
+      findMatchIndex = backwards ? matches.length - 1 : 0;
+    } else {
+      findMatchIndex = (findMatchIndex + (backwards ? -1 : 1) + matches.length) % matches.length;
+    }
+    findQuery = query;
+    var match = matches[findMatchIndex];
+    term.select(match.column, match.row, query.length);
+    term.scrollToLine(match.row);
+    return (findMatchIndex + 1) + '/' + matches.length;
+  };
   window.getTermSize = function () { return term.cols + ',' + term.rows; };
 
   // ── Selection / clipboard ──
@@ -394,14 +424,6 @@
       fallbackCopy(sel);
     }
     term.focus();
-  }
-
-  function pasteClipboard() {
-    if (navigator.clipboard && navigator.clipboard.readText) {
-      navigator.clipboard.readText().then(function (t) {
-        if (t) term.paste(t);
-      }).catch(function () {});
-    }
   }
 
   // Keyboard: Ctrl+C copies only when there is a selection (otherwise the PTY
@@ -433,7 +455,6 @@
   // Right-click is handled by the ArkUI native context menu; expose the
   // clipboard/selection actions it invokes.
   window.termCopySelection = copySelection;
-  window.termPasteClipboard = pasteClipboard;
   window.termSelectAll = function () { term.selectAll(); };
   // Chromium maps Ctrl+wheel to page zoom. Terminal font size is controlled
   // only from terminAI settings, so consume that gesture without changing the

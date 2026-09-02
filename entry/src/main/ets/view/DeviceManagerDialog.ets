@@ -15,6 +15,7 @@ export struct DeviceManagerDialog {
   onDevicesChanged: (value: string) => void = () => {};
   onDeviceSaved: (device: ManagedDevice, credential: string, isNew: boolean) => Promise<boolean> =
     async () => false;
+  onDeviceCommitted: (device: ManagedDevice) => void = () => {};
   onDeviceRemoved: (device: ManagedDevice) => void = () => {};
   onConnect: (device: ManagedDevice) => void = () => {};
 
@@ -79,6 +80,9 @@ export struct DeviceManagerDialog {
     if (this.connectionBusy(device)) {
       return '连接中';
     }
+    if (this.connectionState(device) === SshConnectionState.Reconnecting) {
+      return '立即重连';
+    }
     return this.connectionReady(device) ? '打开终端' : '连接';
   }
 
@@ -87,10 +91,12 @@ export struct DeviceManagerDialog {
       return Theme.success(this.isDark);
     }
     const state = this.connectionState(device);
-    if (state === SshConnectionState.Connecting || state === SshConnectionState.Scanning) {
+    if (state === SshConnectionState.Connecting || state === SshConnectionState.Scanning ||
+      state === SshConnectionState.Reconnecting) {
       return this.accentOf();
     }
     if (state === SshConnectionState.AuthFailed || state === SshConnectionState.NeedsCredential ||
+      state === SshConnectionState.HostKeyFailed || state === SshConnectionState.NetworkFailed ||
       state === SshConnectionState.Failed) {
       return Theme.danger(this.isDark);
     }
@@ -273,33 +279,35 @@ export struct DeviceManagerDialog {
     const name = this.name.trim().length > 0 ? this.name.trim() : target;
     const isNew = this.editingId.length === 0;
     let savedDevice: ManagedDevice;
+    const nextDevices: ManagedDevice[] = [...this.devices];
     if (!isNew) {
-      const index = this.devices.findIndex((item: ManagedDevice) => item.id === this.editingId);
+      const index = nextDevices.findIndex((item: ManagedDevice) => item.id === this.editingId);
       if (index < 0) {
         this.errorText = '设备不存在，请重新添加';
         return;
       }
       const identityPath = this.authMode === SshAuthMode.PrivateKey ? this.identityFile.trim() : '';
       savedDevice = new ManagedDevice(this.editingId, name, target, this.authMode, identityPath);
-      this.devices[index] = savedDevice;
+      nextDevices[index] = savedDevice;
     } else {
       const identityPath = this.authMode === SshAuthMode.PrivateKey ? this.identityFile.trim() : '';
       savedDevice = new ManagedDevice(newDeviceId(), name, target, this.authMode, identityPath);
-      this.devices.push(savedDevice);
-      // If credential persistence fails, a retry edits this same device rather
-      // than appending a duplicate row.
-      this.editingId = savedDevice.id;
+      nextDevices.push(savedDevice);
     }
     this.saving = true;
-    this.devices = [...this.devices];
-    this.devicesEncoded = encodeDevices(this.devices);
-    this.onDevicesChanged(this.devicesEncoded);
     const completed = await this.onDeviceSaved(savedDevice, this.credential, isNew);
     if (!completed) {
       this.saving = false;
       this.errorText = 'SSH 登录凭据未能保存，请重试';
       return;
     }
+    // Commit the visible/persisted device list only after credential storage
+    // succeeds. updateDevices may close sessions whose target changed, so it
+    // must never run on the failure path.
+    this.devices = nextDevices;
+    this.devicesEncoded = encodeDevices(this.devices);
+    this.onDevicesChanged(this.devicesEncoded);
+    this.onDeviceCommitted(savedDevice);
     if (this.credential.length > 0) {
       this.storedCredential = true;
       this.storedCredentialLength = this.credentialCharacterCount(this.credential);

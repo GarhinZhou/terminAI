@@ -9,6 +9,7 @@ export enum IconName {
   Settings = 'settings',
   SidebarHide = 'sidebar_hide',
   SidebarShow = 'sidebar_show',
+  Split = 'split',
   ChevronDown = 'chevron_down',
   ChevronRight = 'chevron_right',
   More = 'more',
@@ -20,6 +21,7 @@ export enum IconName {
   Notifications = 'notifications',
   Info = 'info',
   Check = 'check',
+  Close = 'close',
   EmptyTerminal = 'empty_terminal'
 }
 
@@ -40,6 +42,7 @@ export struct UiIcon {
       case IconName.Settings: return $r('app.media.ui_settings');
       case IconName.SidebarHide: return $r('app.media.ui_sidebar_hide');
       case IconName.SidebarShow: return $r('app.media.ui_sidebar_show');
+      case IconName.Split: return $r('app.media.ui_split');
       case IconName.ChevronDown: return $r('app.media.ui_chevron_down');
       case IconName.ChevronRight: return $r('app.media.ui_chevron_right');
       case IconName.More: return $r('app.media.ui_more');
@@ -51,6 +54,7 @@ export struct UiIcon {
       case IconName.Notifications: return $r('app.media.ui_notifications');
       case IconName.Info: return $r('app.media.ui_info');
       case IconName.Check: return $r('app.media.ui_check');
+      case IconName.Close: return $r('app.media.ui_close');
       case IconName.EmptyTerminal: return $r('app.media.ui_empty_terminal');
       default: return $r('app.media.ui_terminal');
     }

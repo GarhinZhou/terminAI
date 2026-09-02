@@ -2,13 +2,14 @@
 import libterminal from 'libterminal.so';
 import { webview } from '@kit.ArkWeb';
 import { pasteboard } from '@kit.BasicServicesKit';
-import { TerminalSession, SessionEvent, TerminalOutputSlice,
+import { NativeStartDisposition, TerminalSession, SessionEvent, TerminalOutputSlice,
   TerminalOutputSnapshot } from '../model/TerminalSession';
 import { Theme } from '../common/Theme';
 import { ManagedDevice, decodeDevices, normalizedSshTarget,
   sshAuthenticationArguments } from '../model/ManagedDevice';
 import { SshCredentialStore } from '../model/SshCredentialStore';
 import { SshSecretValue } from '../model/RemoteSshState';
+import { IconName, UiIcon } from '../common/Icons';
 
 const KEYCODE_CTRL_LEFT = 2072;
 const KEYCODE_CTRL_RIGHT = 2073;
@@ -18,7 +19,14 @@ const KEYCODE_K = 2027;
 const KEYCODE_T = 2036;
 const KEYCODE_W = 2039;
 const KEYCODE_B = 2018;
+const KEYCODE_D = 2020;
+const KEYCODE_F = 2022;
+const KEYCODE_ALT_LEFT = 2045;
+const KEYCODE_ALT_RIGHT = 2046;
 const KEYCODE_N = 2030;
+const KEYCODE_ARROW_UP = 2012;
+const KEYCODE_ARROW_DOWN = 2013;
+const KEYCODE_ESCAPE = 2070;
 const RENDER_BATCH_DELAY = 16;
 const OUTPUT_MESSAGE_CHUNK = 32 * 1024;
 const REPLAY_PROGRESS_TIMEOUT = 8000;
@@ -29,7 +37,10 @@ const OUTPUT_MESSAGE_REPLAY_END = 'E';
 const OUTPUT_MESSAGE_HEARTBEAT = 'Q';
 const OUTPUT_MESSAGE_CHECKPOINT_REQUEST = 'S';
 const RENDERER_HEARTBEAT_INTERVAL = 5000;
-const RENDERER_HEARTBEAT_TIMEOUT = 3500;
+// A busy xterm replay can occupy ArkWeb's JS thread for several seconds. Keep
+// heartbeat failure well outside the normal replay window to avoid a
+// slow -> reload -> larger replay feedback loop.
+const RENDERER_HEARTBEAT_TIMEOUT = 12000;
 const RENDERER_UNRESPONSIVE_GRACE = 2500;
 const TERMINAL_CHECKPOINT_DELAY = 900;
 
@@ -72,8 +83,15 @@ class TermBridge {
 export struct TerminalView {
   @ObjectLink session: TerminalSession;
   @Prop @Watch('onActiveChanged') active: boolean = true;
+  @Prop @Watch('onFocusRequestChanged') focusRequest: number = 0;
+  @Prop @Watch('onLayoutRefreshRequestChanged') layoutRefreshRequest: number = 0;
   onEvent: (ev: SessionEvent) => void = () => {};
-  onShortcut: (keyCode: number, shift: boolean) => void = () => {};
+  onShortcut: (keyCode: number, shift: boolean, alt: boolean) => void = () => {};
+  onCloseSession: (uid: number) => void = () => {};
+  /** Keyboard-focus ownership; both split panes stay active for rendering. */
+  @Prop @Watch('onFocusEligibleChanged') focusEligible: boolean = true;
+  /** Reports ArkUI node focus so Index knows which split pane was clicked. */
+  onViewFocus: (uid: number) => void = () => {};
   // Style state mirrored from AppStorage; changes push into xterm.js.
   @StorageProp('fontSize') @Watch('onStyleChanged') fontSize: number = 14;
   @StorageProp('fontBold') @Watch('onStyleChanged') fontBold: boolean = false;
@@ -84,9 +102,13 @@ export struct TerminalView {
   @StorageProp('scrollback') @Watch('onScrollbackChanged') scrollback: number = 10000;
   @StorageProp('lineHeight') @Watch('onStyleChanged') lineHeight: number = 1.0;
   @StorageProp('devicesEncoded') devicesEncoded: string = '';
+  @StorageProp('notificationPermissionPromptPending')
+  @Watch('onNotificationPermissionPromptChanged')
+  notificationPermissionPromptPending: boolean = false;
   private controller: webview.WebviewController = new webview.WebviewController();
   private termBridge: TermBridge | null = null;
   private ctrlDown: boolean = false;
+  private altDown: boolean = false;
   private shiftDown: boolean = false;
   private interceptedShortcutKeyCode: number = 0;
   private pageReady: boolean = false;
@@ -121,11 +143,20 @@ export struct TerminalView {
   private rendererHeartbeatAwaiting: boolean = false;
   private rendererUnresponsiveTimer: number = -1;
   private checkpointTimer: number = -1;
+  private layoutFitScheduled: boolean = false;
+  private nativeStartGeneration: number = 0;
   private styleDirty: boolean = true;
   private scrollbackDirty: boolean = true;
   @State private rendererUnavailable: boolean = false;
   @State private rendererFailureReason: string = '';
+  @State private searchVisible: boolean = false;
+  @State private searchQuery: string = '';
+  @State private searchResult: string = '';
+  @State private searchHoveredAction: string = '';
+  @State private searchPressedAction: string = '';
+  @State private searchFocusedAction: string = '';
   private outputOwner: TerminalSession | null = null;
+  private outputSubscriptionId: number = -1;
   private outputHandler: (data: string) => void = (data: string) => {
     this.queueTerminalOutput(data);
   };
@@ -137,8 +168,16 @@ export struct TerminalView {
     return this.termBridge;
   }
 
-  private isApplicationShortcut(keyCode: number): boolean {
-    return keyCode === KEYCODE_K || keyCode === KEYCODE_T || keyCode === KEYCODE_W ||
+  private isApplicationShortcut(keyCode: number, alt: boolean): boolean {
+    // Ctrl+D must reach the PTY (EOF / delete-forward); only the
+    // Ctrl+Alt+D split toggle is an application shortcut.
+    if (keyCode === KEYCODE_D) {
+      return alt;
+    }
+    if (alt) {
+      return false;
+    }
+    return keyCode === KEYCODE_F || keyCode === KEYCODE_K || keyCode === KEYCODE_T || keyCode === KEYCODE_W ||
       keyCode === KEYCODE_B || keyCode === KEYCODE_N;
   }
 
@@ -157,17 +196,25 @@ export struct TerminalView {
       this.shiftDown = event.type === KeyType.Down;
       return false;
     }
+    if (event.keyCode === KEYCODE_ALT_LEFT || event.keyCode === KEYCODE_ALT_RIGHT) {
+      this.altDown = event.type === KeyType.Down;
+      return false;
+    }
     if (event.type === KeyType.Up && event.keyCode === this.interceptedShortcutKeyCode) {
       this.interceptedShortcutKeyCode = 0;
       return true;
     }
     if (event.type !== KeyType.Down || !this.ctrlDown ||
-      !this.isApplicationShortcut(event.keyCode)) {
+      !this.isApplicationShortcut(event.keyCode, this.altDown)) {
       return false;
     }
     if (this.interceptedShortcutKeyCode !== event.keyCode) {
       this.interceptedShortcutKeyCode = event.keyCode;
-      this.onShortcut(event.keyCode, this.shiftDown);
+      if (event.keyCode === KEYCODE_F) {
+        this.openTerminalSearch();
+      } else {
+        this.onShortcut(event.keyCode, this.shiftDown, this.altDown);
+      }
     }
     // true = application consumed this shortcut, so xterm must not receive it.
     return true;
@@ -293,7 +340,7 @@ export struct TerminalView {
   }
 
   private focusTerminalInput(): void {
-    if (!this.active || !this.pageReady) return;
+    if (!this.active || !this.focusEligible || !this.pageReady || this.notificationPermissionPromptPending) return;
     try {
       this.getUIContext().getFocusController().requestFocus(this.terminalFocusId());
     } catch (error) {
@@ -303,8 +350,43 @@ export struct TerminalView {
   }
 
   private scheduleTerminalFocus(): void {
-    if (!this.active || !this.pageReady) return;
+    if (!this.active || !this.focusEligible || !this.pageReady) return;
     setTimeout(() => { this.focusTerminalInput(); }, 0);
+  }
+
+  onNotificationPermissionPromptChanged(): void {
+    if (!this.notificationPermissionPromptPending) {
+      this.scheduleTerminalFocus();
+    }
+  }
+
+  onFocusRequestChanged(): void {
+    this.scheduleTerminalFocus();
+  }
+
+  /** Fit only the existing xterm grid; never reload ArkWeb or replay history. */
+  private scheduleTerminalLayoutFit(): void {
+    if (!this.active || !this.pageReady || this.layoutFitScheduled) {
+      return;
+    }
+    this.layoutFitScheduled = true;
+    setTimeout(() => {
+      this.layoutFitScheduled = false;
+      if (!this.active || !this.pageReady) {
+        return;
+      }
+      this.controller.runJavaScript('window.termFitNow()').catch((error: Error) => {
+        console.error('TERMINAI fit terminal after split layout failed: ' + error.message);
+      });
+    }, 0);
+  }
+
+  onLayoutRefreshRequestChanged(): void {
+    this.scheduleTerminalLayoutFit();
+  }
+
+  onFocusEligibleChanged(): void {
+    this.scheduleTerminalFocus();
   }
 
   private updateRendererActivity(): void {
@@ -538,7 +620,10 @@ export struct TerminalView {
     this.liveWriteGeneration++;
   }
 
-  private handleOutputPortMessage(message: webview.WebMessage): void {
+  private handleOutputPortMessage(portGeneration: number, message: webview.WebMessage): void {
+    if (portGeneration !== this.outputPortGeneration) {
+      return;
+    }
     if (message === 'P') {
       this.outputPortReady = true;
       this.outputPortRetryCount = 0;
@@ -607,7 +692,7 @@ export struct TerminalView {
       // ArkWeb requires a receiver to be registered before this endpoint can
       // send. Terminal input still uses the existing JavaScript proxy.
       ports[1].onMessageEvent((message: webview.WebMessage) => {
-        this.handleOutputPortMessage(message);
+        this.handleOutputPortMessage(portGeneration, message);
       });
       this.controller.postMessage('__terminai_output_port__', [ports[0]], '*');
       this.outputPorts = ports;
@@ -824,6 +909,101 @@ export struct TerminalView {
     this.scheduleRendererReload();
   }
 
+  private restartSession(): void {
+    if (!this.session.prepareRestart()) {
+      return;
+    }
+    this.startNativeSession();
+  }
+
+  private searchFocusId(): string {
+    return 'terminal_search_' + this.session.uid.toString();
+  }
+
+  private openTerminalSearch(): void {
+    this.searchVisible = true;
+  }
+
+  private closeTerminalSearch(): void {
+    this.searchVisible = false;
+    this.searchResult = '';
+    this.scheduleTerminalFocus();
+  }
+
+  private performTerminalSearch(backwards: boolean, query: string = this.searchQuery): void {
+    const trimmed = query.trim();
+    if (trimmed.length === 0 || !this.pageReady) {
+      this.searchResult = '';
+      return;
+    }
+    const script = 'window.termFind(' + JSON.stringify(trimmed) + ',' +
+      (backwards ? 'true' : 'false') + ')';
+    this.controller.runJavaScript(script)
+      .then((result: string) => {
+        this.searchResult = result.replace(/^"|"$/g, '');
+      })
+      .catch((error: Error) => {
+        this.searchResult = '';
+        console.error('TERMINAI terminal search failed: ' + error.message);
+      });
+  }
+
+  private handleSearchKey(event: KeyEvent): boolean {
+    if (event.type !== KeyType.Down) {
+      return false;
+    }
+    if (event.keyCode === KEYCODE_ARROW_UP) {
+      this.performTerminalSearch(true);
+      return true;
+    }
+    if (event.keyCode === KEYCODE_ARROW_DOWN) {
+      this.performTerminalSearch(false);
+      return true;
+    }
+    if (event.keyCode === KEYCODE_ESCAPE) {
+      this.closeTerminalSearch();
+      return true;
+    }
+    return false;
+  }
+
+  private searchResultLabel(): string {
+    if (this.searchQuery.trim().length === 0 || this.searchResult.length === 0) {
+      return '—';
+    }
+    return this.searchResult.replace('/', ' / ');
+  }
+
+  private searchActionBackground(key: string): string {
+    if (this.searchPressedAction === key) {
+      return Theme.pressed(this.isDark);
+    }
+    if (this.searchHoveredAction === key || this.searchFocusedAction === key) {
+      return Theme.hover(this.isDark);
+    }
+    return '#00000000';
+  }
+
+  private searchActionScale(key: string): number {
+    return this.searchPressedAction === key ? 0.96 : 1;
+  }
+
+  private onSearchActionMouse(key: string, event: MouseEvent): void {
+    if (event.button !== MouseButton.Left) {
+      return;
+    }
+    this.searchPressedAction = event.action === MouseAction.Press ? key : '';
+  }
+
+  private onSearchActionTouch(key: string, event: TouchEvent): void {
+    if (event.type === TouchType.Down) {
+      this.searchPressedAction = key;
+    } else if ((event.type === TouchType.Up || event.type === TouchType.Cancel) &&
+      this.searchPressedAction === key) {
+      this.searchPressedAction = '';
+    }
+  }
+
   private watchLiveWriteCompletion(generation: number): void {
     this.clearLiveWriteWatchdog();
     this.liveWriteWatchdogTimer = setTimeout(() => {
@@ -838,7 +1018,10 @@ export struct TerminalView {
   aboutToAppear(): void {
     this.terminalBridge();
     this.outputOwner = this.session;
-    this.outputOwner.onOutput = this.outputHandler;
+    if (this.outputSubscriptionId > 0) {
+      this.outputOwner.unsubscribeOutput(this.outputSubscriptionId);
+    }
+    this.outputSubscriptionId = this.outputOwner.subscribeOutput(this.outputHandler);
   }
 
 
@@ -849,90 +1032,92 @@ export struct TerminalView {
     this.renderScheduled = false;
     this.outputPortRetryScheduled = false;
     this.rendererReloadScheduled = false;
+    this.layoutFitScheduled = false;
     this.closeOutputPort();
-    // A replacement view may already own this session while ArkUI disposes
-    // the old Web node. Never let the old node detach the new output route.
-    if (this.outputOwner !== null && this.outputOwner.onOutput === this.outputHandler) {
-      this.outputOwner.onOutput = () => {};
+    if (this.outputOwner !== null) {
+      this.outputOwner.unsubscribeOutput(this.outputSubscriptionId);
     }
+    this.outputSubscriptionId = -1;
     this.outputOwner = null;
   }
   private async createNativeSession(cols: number, rows: number, nativeCwd: string,
-    nativeCommand: string): Promise<void> {
+    nativeCommand: string, generation: number): Promise<void> {
     const remote = this.session.sshTarget.length > 0;
     const secret = new SshSecretValue(remote ?
       await SshCredentialStore.loadForDevice(this.remoteDevice()) : '');
     let id = -1;
-    if (this.session.disposed) {
+    if (!this.session.isCurrentStart(generation)) {
       secret.value = '';
-      this.session.startInProgress = false;
       return;
     }
     try {
       if (remote) {
         id = libterminal.createSessionWithSecret(cols, rows, nativeCwd, nativeCommand, secret.value,
           (ev: SessionEvent) => {
-            this.session.onNativeEvent(ev);
+            this.session.onNativeEvent(generation, ev);
           });
       } else {
         id = libterminal.createSession(cols, rows, nativeCwd, nativeCommand,
           (ev: SessionEvent) => {
-            this.session.onNativeEvent(ev);
+            this.session.onNativeEvent(generation, ev);
           });
       }
       secret.value = '';
     } catch (e) {
       secret.value = '';
-      this.session.startInProgress = false;
       console.error('TERMINAI native session creation threw: ' + JSON.stringify(e));
       throw new Error('无法创建终端会话');
     }
     if (id <= 0) {
-      this.session.startInProgress = false;
       throw new Error('原生终端返回了无效会话');
     }
-    this.session.id = id;
-    this.session.alive = true;
-    this.session.nativeStartCompleted = true;
-    this.session.startInProgress = false;
+    const disposition = this.session.completeNativeStart(generation, id);
+    if (disposition === NativeStartDisposition.Stale) {
+      libterminal.killSessionAsync(id).catch((error: Error) => {
+        console.error('TERMINAI stale native session cleanup failed: ' + error.message);
+      });
+      return;
+    }
+    if (disposition === NativeStartDisposition.AlreadyExited) {
+      return;
+    }
     console.info('TERMINAI startNativeSession: session created id=' + id);
     if (this.active) {
       this.scheduleTerminalFocus();
     }
   }
 
-  private createNativeSessionAtSize(cols: number, rows: number): void {
-    if (this.session.disposed || this.session.nativeStartCompleted) {
-      this.session.startInProgress = false;
+  private createNativeSessionAtSize(cols: number, rows: number, generation: number): void {
+    if (!this.session.isCurrentStart(generation) || this.session.nativeStartCompleted) {
       return;
     }
     try {
       const nativeCwd = this.session.sshTarget.length > 0 ? '~' : this.session.cwd;
       const nativeCommand = this.session.sshTarget.length > 0 ? this.remoteStartCommand() :
         this.localStartCommand();
-      this.createNativeSession(cols, rows, nativeCwd, nativeCommand)
+      this.createNativeSession(cols, rows, nativeCwd, nativeCommand, generation)
         .catch((error: Error) => {
-          this.session.startInProgress = false;
+          this.session.markStartFailure(generation, error.message);
           console.error('TERMINAI session create failed: ' + error.message);
         });
     } catch (error) {
-      this.session.startInProgress = false;
+      this.session.markStartFailure(generation, JSON.stringify(error));
       console.error('TERMINAI session command failed: ' + JSON.stringify(error));
     }
   }
 
   private startNativeSession(): void {
-    if (this.session.id > 0 || this.session.startInProgress ||
-      this.session.nativeStartCompleted || this.session.disposed) {
+    const generation = this.session.beginNativeStart();
+    if (generation <= 0) {
       return;
     }
-    this.session.startInProgress = true;
+    this.nativeStartGeneration = generation;
     // Ask the page for the real terminal size, then spawn the shell.
     console.info('TERMINAI startNativeSession: querying page size');
     this.controller.runJavaScript('window.getTermSize()')
       .then((sizeStr: string) => {
-        if (this.session.disposed || this.session.nativeStartCompleted) {
-          this.session.startInProgress = false;
+        if (!this.session.isCurrentStart(generation) ||
+          this.nativeStartGeneration !== generation || this.session.nativeStartCompleted) {
           return;
         }
         let cols = 80;
@@ -949,13 +1134,13 @@ export struct TerminalView {
           }
         }
         console.info('TERMINAI startNativeSession: page size=' + sizeStr + ' -> ' + cols + 'x' + rows);
-        this.createNativeSessionAtSize(cols, rows);
+        this.createNativeSessionAtSize(cols, rows, generation);
       })
       .catch((e: Error) => {
         // A page can reject this query while recovering. Starting at a safe
         // default size is preferable to leaving a permanently blank session.
         console.error('TERMINAI getTermSize failed, using 80x24: ' + e.message);
-        this.createNativeSessionAtSize(80, 24);
+        this.createNativeSessionAtSize(80, 24, generation);
       });
   }
 
@@ -983,6 +1168,7 @@ export struct TerminalView {
           controller: this.controller
         })
         .domStorageAccess(true)
+        .onFocus(() => { this.onViewFocus(this.session.uid); })
         .onInterceptKeyEvent((event: KeyEvent) => this.interceptKeyEvent(event))
         .onPageEnd(() => {
           console.info('TERMINAI onPageEnd fired');
@@ -1051,6 +1237,19 @@ export struct TerminalView {
           if (isVisible && this.active) this.scheduleTerminalFocus();
         })
         .height('100%')
+        .onAreaChange((oldValue: Area, newValue: Area) => {
+          if (!this.pageReady) {
+            return;
+          }
+          const widthChanged = (oldValue.width as number) !== (newValue.width as number);
+          const heightChanged = (oldValue.height as number) !== (newValue.height as number);
+          if (widthChanged || heightChanged) {
+            // ArkWeb does not reflow its surface on local layout changes (split
+            // open / orientation flip); only a full-window resize triggers the
+            // in-page ResizeObserver. Force a fit so xterm re-layouts promptly.
+            this.scheduleTerminalLayoutFit();
+          }
+        })
         .backgroundColor(Theme.terminalBg(this.isDark))
         .bindContextMenu(this.termMenuBuilder, ResponseType.RightClick)
 
@@ -1079,12 +1278,142 @@ export struct TerminalView {
         .backgroundColor(Theme.card(this.isDark))
         .border({ width: 1, color: Theme.border(this.isDark), radius: 12 })
         .borderRadius(12)
+          .alignItems(HorizontalAlign.Center)
+      }
+
+      if (!this.session.alive &&
+        this.session.nativeStartCompleted && !this.session.startInProgress) {
+        Column() {
+          Text(this.session.sshTarget.length > 0 ? 'SSH 会话已断开' : '本地会话已结束')
+            .fontSize(16)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(Theme.text(this.isDark))
+          Text(this.session.exitCode >= 0 ?
+            (this.session.sshTarget.length > 0 ? '远端连接' : '本地进程') +
+              '已经结束，退出码 ' + this.session.exitCode.toString() :
+            (this.session.sshTarget.length > 0 ? '远端连接已经结束' : '本地进程启动失败'))
+            .fontSize(12)
+            .fontColor(Theme.tertiary(this.isDark))
+            .margin({ top: 7, bottom: 14 })
+          Button(this.session.sshTarget.length > 0 ? '重新连接' : '重新启动')
+            .height(34)
+            .fontSize(13)
+            .fontColor('#FFFFFF')
+            .backgroundColor(Theme.accent(this.isDark))
+            .borderRadius(8)
+            .onClick(() => { this.restartSession(); })
+        }
+        .width(320)
+        .padding({ left: 22, right: 22, top: 20, bottom: 20 })
+        .backgroundColor(Theme.card(this.isDark))
+        .border({ width: 1, color: Theme.border(this.isDark), radius: 12 })
+        .borderRadius(12)
         .alignItems(HorizontalAlign.Center)
+      }
+
+      if (this.searchVisible) {
+        Row({ space: 7 }) {
+          Row({ space: 7 }) {
+            UiIcon({ name: IconName.Search, iconSize: 16, color: Theme.tertiary(this.isDark) })
+            TextInput({ placeholder: '查找终端内容', text: this.searchQuery })
+              .id(this.searchFocusId())
+              // Let ArkUI assign focus after the conditional node is mounted.
+              // Calling requestFocus from the state-changing timer can run before
+              // this TextInput exists and throws BusinessError 150003.
+              .defaultFocus(true)
+              .layoutWeight(1)
+              .height(36)
+              .fontSize(15)
+              .fontColor(Theme.text(this.isDark))
+              .placeholderColor(Theme.tertiary(this.isDark))
+              .caretColor(Theme.accent(this.isDark))
+              .backgroundColor('#00000000')
+              .padding(0)
+              .onChange((value: string) => {
+                this.searchQuery = value;
+                this.performTerminalSearch(false, value);
+              })
+              .onSubmit(() => { this.performTerminalSearch(false); })
+              .onKeyEvent((event: KeyEvent) => this.handleSearchKey(event))
+            Text(this.searchResultLabel())
+              .constraintSize({ minWidth: 40, maxWidth: 96 })
+              .height(24)
+              .padding({ left: 7, right: 7 })
+              .fontSize(11)
+              .fontColor(Theme.tertiary(this.isDark))
+              .textAlign(TextAlign.Center)
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .backgroundColor(Theme.buttonGhost(this.isDark))
+              .borderRadius(5)
+          }
+          .width(286)
+          .height(40)
+          .padding({ left: 11, right: 8 })
+          .backgroundColor(Theme.input(this.isDark))
+          .border({ width: 1, color: Theme.accent(this.isDark), radius: 9 })
+          .borderRadius(9)
+
+          Divider()
+            .vertical(true)
+            .height(24)
+            .strokeWidth(1)
+            .color(Theme.divider(this.isDark))
+
+          this.searchActionButton(IconName.ChevronDown, 'previous', '上一个匹配项', 180,
+            () => { this.performTerminalSearch(true); })
+          this.searchActionButton(IconName.ChevronDown, 'next', '下一个匹配项', 0,
+            () => { this.performTerminalSearch(false); })
+          this.searchActionButton(IconName.Close, 'close', '关闭查找', 0,
+            () => { this.closeTerminalSearch(); })
+        }
+        .height(52)
+        .padding({ left: 8, right: 8 })
+        .backgroundColor(Theme.panel(this.isDark))
+        .border({ width: 1, color: Theme.border(this.isDark), radius: 11 })
+        .borderRadius(11)
+        .shadow({ radius: 8, color: '#26000000', offsetY: 2 })
+        .align(Alignment.TopEnd)
+        .margin({ top: 10, right: 14 })
       }
     }
     .width('100%')
     .height('100%')
     .backgroundColor(Theme.terminalBg(this.isDark))
+  }
+
+  @Builder
+  searchActionButton(icon: IconName, key: string, label: string, rotation: number,
+    action: () => void) {
+    Button({ type: ButtonType.Normal, stateEffect: false }) {
+      UiIcon({ name: icon, iconSize: 15, color: Theme.subText(this.isDark) })
+        .rotate({ angle: rotation })
+    }
+    .width(34)
+    .height(34)
+    .padding(0)
+    .borderRadius(8)
+    .backgroundColor(this.searchActionBackground(key))
+    .border({
+      width: this.searchFocusedAction === key ? 1 : 0,
+      color: Theme.accent(this.isDark),
+      radius: 8
+    })
+    .scale({ x: this.searchActionScale(key), y: this.searchActionScale(key) })
+    .focusable(true)
+    .focusOnTouch(true)
+    .onFocus(() => { this.searchFocusedAction = key; })
+    .onBlur(() => {
+      if (this.searchFocusedAction === key) this.searchFocusedAction = '';
+    })
+    .onHover((isHover: boolean) => {
+      this.searchHoveredAction = isHover ? key : '';
+      if (!isHover && this.searchPressedAction === key) this.searchPressedAction = '';
+    })
+    .onMouse((event: MouseEvent) => { this.onSearchActionMouse(key, event); })
+    .onTouch((event: TouchEvent) => { this.onSearchActionTouch(key, event); })
+    .onClick(() => { action(); })
+    .accessibilityText(label)
   }
 
   @Builder
@@ -1103,6 +1432,22 @@ export struct TerminalView {
         .onClick(() => {
           this.controller.runJavaScript('window.termSelectAll()').catch(() => {});
         })
+      MenuItem({ content: '查找' })
+        .height(36)
+        .onClick(() => { this.openTerminalSearch(); })
+      MenuItem({ content: '清空屏幕' })
+        .height(36)
+        .onClick(() => {
+          this.controller.runJavaScript('window.termClear(); window.termFocus()').catch(() => {});
+        })
+      if (!this.session.alive && this.session.nativeStartCompleted && !this.session.startInProgress) {
+        MenuItem({ content: this.session.sshTarget.length > 0 ? '重新连接' : '重新启动' })
+          .height(36)
+          .onClick(() => { this.restartSession(); })
+      }
+      MenuItem({ content: '关闭会话' })
+        .height(36)
+        .onClick(() => { this.onCloseSession(this.session.uid); })
     }
     .width(140)
     .font({ size: 14 })

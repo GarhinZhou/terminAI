@@ -1,0 +1,191 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+
+const terminalRoot = new URL('../entry/src/main/resources/rawfile/terminal/', import.meta.url);
+const html = fs.readFileSync(new URL('terminal.html', terminalRoot), 'utf8');
+const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/);
+assert.ok(scriptMatch, 'terminal.html must contain its protocol script');
+
+const writes = [];
+const pendingWriteCallbacks = [];
+let terminal = null;
+
+class StressTerminal {
+  constructor(options) {
+    this.options = options;
+    this.cols = 80;
+    this.rows = 24;
+    this.autoCompleteWrites = true;
+    this.buffer = {
+      active: {
+        baseY: 0,
+        cursorY: 0,
+        getLine: () => null
+      }
+    };
+    terminal = this;
+  }
+
+  loadAddon(addon) { if (addon.activate) addon.activate(this); }
+  open() {}
+  onData(callback) { this.dataCallback = callback; }
+  onResize(callback) { this.resizeCallback = callback; }
+  onTitleChange(callback) { this.titleCallback = callback; }
+  onWriteParsed(callback) { this.writeParsedCallback = callback; }
+  attachCustomKeyEventHandler(callback) { this.keyCallback = callback; }
+  write(data, callback) {
+    writes.push(data);
+    if (!callback) return;
+    if (this.autoCompleteWrites) callback();
+    else pendingWriteCallbacks.push(callback);
+  }
+  completeNextWrite() {
+    const callback = pendingWriteCallbacks.shift();
+    assert.ok(callback, 'a terminal write callback must be pending');
+    callback();
+  }
+  reset() {}
+  clear() {}
+  focus() {}
+  paste() {}
+  getSelection() { return ''; }
+  hasSelection() { return false; }
+  selectAll() {}
+}
+
+class StressFitAddon {
+  fit() {}
+}
+
+class StressSerializeAddon {
+  activate() {}
+  serialize(options) {
+    if (options.scrollback >= 1000) return 'x'.repeat(600 * 1024);
+    return 'checkpoint-' + options.scrollback.toString();
+  }
+}
+
+const windowListeners = new Map();
+const terminalElement = { style: {} };
+const document = {
+  documentElement: { style: {} },
+  body: { style: {}, appendChild() {}, removeChild() {} },
+  getElementById: () => terminalElement,
+  addEventListener() {},
+  createElement: () => ({ style: {}, select() {} }),
+  execCommand: () => true
+};
+const windowObject = {
+  addEventListener: (name, callback) => { windowListeners.set(name, callback); },
+  ResizeObserver: undefined
+};
+const context = {
+  Terminal: StressTerminal,
+  FitAddon: { FitAddon: StressFitAddon },
+  SerializeAddon: { SerializeAddon: StressSerializeAddon },
+  window: windowObject,
+  document,
+  navigator: {},
+  console,
+  setTimeout,
+  clearTimeout,
+  requestAnimationFrame: (callback) => setTimeout(callback, 0),
+  cancelAnimationFrame: clearTimeout,
+  ResizeObserver: undefined
+};
+vm.runInNewContext(scriptMatch[1], context, { filename: 'terminal.html' });
+
+const sent = [];
+const port = {
+  onmessage: null,
+  onmessageerror: null,
+  postMessage(message) { sent.push(message); }
+};
+const messageListener = windowListeners.get('message');
+assert.ok(messageListener, 'MessagePort listener must exist');
+messageListener({ data: '__terminai_output_port__', ports: [port] });
+assert.equal(sent.at(-1), 'P');
+
+// Sustained live output: every burst is rendered once and acknowledged once.
+writes.length = 0;
+sent.length = 0;
+for (let index = 0; index < 10000; index++) {
+  port.onmessage({ data: 'D' + index.toString() + '\npacket-' + index.toString() + '\n' });
+}
+assert.equal(writes.length, 10000);
+assert.equal(writes[0], 'packet-0\n');
+assert.equal(writes.at(-1), 'packet-9999\n');
+assert.equal(sent.length, 10000);
+assert.equal(sent[0], 'A0');
+assert.equal(sent.at(-1), 'A9999');
+
+// Live PTY output arriving during replay must wait behind every replay chunk.
+writes.length = 0;
+sent.length = 0;
+terminal.autoCompleteWrites = false;
+port.onmessage({ data: 'B100' });
+port.onmessage({ data: 'R100\nold-a' });
+port.onmessage({ data: 'R100\nold-b' });
+port.onmessage({ data: 'D201\nlive-a' });
+port.onmessage({ data: 'D202\nlive-b' });
+port.onmessage({ data: 'E100' });
+assert.deepEqual(writes, ['old-a', 'old-b']);
+assert.equal(sent.includes('H100'), false);
+terminal.completeNextWrite();
+assert.equal(sent.includes('H100'), false);
+terminal.completeNextWrite();
+assert.deepEqual(writes, ['old-a', 'old-b', 'live-a', 'live-b']);
+assert.equal(sent.at(-1), 'H100');
+terminal.completeNextWrite();
+terminal.completeNextWrite();
+assert.deepEqual(sent.slice(-2), ['A201', 'A202']);
+
+// A stale callback from an abandoned replay generation cannot complete the new replay.
+writes.length = 0;
+sent.length = 0;
+pendingWriteCallbacks.length = 0;
+port.onmessage({ data: 'B200' });
+port.onmessage({ data: 'R200\nstale' });
+port.onmessage({ data: 'B201' });
+port.onmessage({ data: 'R201\ncurrent' });
+port.onmessage({ data: 'E201' });
+terminal.completeNextWrite();
+assert.equal(sent.includes('H201'), false);
+terminal.completeNextWrite();
+assert.equal(sent.at(-1), 'H201');
+
+// Terminal capability replies generated by replay are suppressed, real input is retained.
+const terminalInputs = [];
+const resizeEvents = [];
+windowObject.ohosBridge = {
+  onTermInput: (value) => terminalInputs.push(value),
+  onTermResize: (cols, rows) => resizeEvents.push(cols.toString() + ',' + rows.toString()),
+  onTermSnapshot() {},
+  onTermTitle() {}
+};
+port.onmessage({ data: 'B300' });
+terminal.dataCallback('\x1b]10;rgb:e2e2/e2e2/e2e2\x07');
+terminal.dataCallback('x');
+port.onmessage({ data: 'E300' });
+assert.deepEqual(terminalInputs, ['x']);
+
+// Checkpoint creation must fall back until the serialized state fits 512 KiB.
+sent.length = 0;
+terminal.autoCompleteWrites = true;
+port.onmessage({ data: 'S777' });
+assert.ok(sent.at(-1).startsWith('C777\ncheckpoint-500'));
+assert.ok(sent.at(-1).length < 512 * 1024);
+
+// Resize storms are coalesced while still committing the exact final PTY size.
+for (let index = 0; index < 500; index++) {
+  terminal.resizeCallback({ cols: 90 + index, rows: 24 + (index % 12) });
+}
+await new Promise((resolve) => setTimeout(resolve, 260));
+assert.equal(resizeEvents.at(-1), '589,31');
+assert.ok(resizeEvents.length < 12, '500 resize events should be folded into a small number of SIGWINCH writes');
+
+port.onmessage({ data: 'Q4242' });
+assert.equal(sent.at(-1), 'q4242');
+
+console.log('terminal sustained-output, replay ordering and resize stress: OK');

@@ -38,6 +38,12 @@
       },
       {
         "name": "ohos.permission.CUSTOM_SANDBOX"
+      },
+      {
+        "name": "ohos.permission.KEEP_BACKGROUND_RUNNING"
+      },
+      {
+        "name": "ohos.permission.PREPARE_APP_TERMINATE"
       }
     ],
     "abilities": [
@@ -47,8 +53,9 @@
         "description": "$string:EntryAbility_desc",
         "icon": "$media:terminai_icon_concept_white",
         "label": "$string:EntryAbility_label",
-        "startWindowIcon": "$media:terminai_icon_concept_white",
+        "startWindowIcon": "$media:terminai_start_icon",
         "startWindowBackground": "$color:start_window_background",
+        "backgroundModes": ["taskKeeping"],
         "exported": true,
         "skills": [
           {
@@ -56,6 +63,17 @@
             "actions": ["ohos.want.action.home"]
           }
         ]
+      },
+      {
+        "name": "ResidentAbility",
+        "srcEntry": "./ets/entryability/ResidentAbility.ets",
+        "description": "$string:EntryAbility_desc",
+        "icon": "$media:terminai_icon_concept_white",
+        "label": "$string:EntryAbility_label",
+        "startWindowIcon": "$media:terminai_start_icon",
+        "startWindowBackground": "$color:start_window_background",
+        "backgroundModes": ["taskKeeping"],
+        "exported": false
       }
     ]
   }

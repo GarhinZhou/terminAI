@@ -16,3 +16,12 @@
 .hvigor-debug.log
 *.p12
 *.p7b
+*.cer
+*.pem
+*.key
+*.csr
+id_rsa*
+id_ed25519*
+.env
+.env.*
+!.env.example

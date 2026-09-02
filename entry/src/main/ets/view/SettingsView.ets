@@ -9,6 +9,7 @@ import { overridesForDevice, setOverridesForDevice } from '../model/AgentOverrid
 import { notificationManager } from '@kit.NotificationKit';
 import { common } from '@kit.AbilityKit';
 import { SessionNotificationService } from '../model/SessionNotificationService';
+import { WindowClosePreference } from '../model/WindowClosePreference';
 
 interface KindRow {
   kind: string;
@@ -56,6 +57,7 @@ export struct SettingsView {
   @StorageLink('themeMode') themeMode: string = 'system';
   @StorageLink('notifyEnabled') notifyEnabled: boolean = false;
   @StorageLink('autoConnectSsh') autoConnectSsh: boolean = false;
+  @StorageLink('keepBackgroundOnClose') keepBackgroundOnClose: boolean = true;
   @StorageLink('cursorStyle') cursorStyle: string = 'block';
   @StorageLink('colorScheme') colorScheme: string = 'default';
   @StorageLink('scrollback') scrollback: number = 10000;
@@ -148,6 +150,17 @@ export struct SettingsView {
       this.getUIContext().getPromptAction().showToast({ message: message });
     } catch (error) {
       console.error('TERMINAI show notification toast failed: ' + JSON.stringify(error));
+    }
+  }
+
+  private changeKeepBackgroundOnClose(on: boolean): void {
+    this.keepBackgroundOnClose = on;
+    const context = this.getUIContext().getHostContext();
+    if (context === undefined) {
+      return;
+    }
+    if (!WindowClosePreference.save(context, on)) {
+      this.showNotificationToast('关闭窗口设置保存失败，请重试');
     }
   }
 
@@ -393,12 +406,27 @@ export struct SettingsView {
               .width('100%')
               .height(46)
               .padding({ left: 12, right: 12 })
+              this.cardDivider()
+              Row() {
+                Text('关闭窗口时保持后台运行')
+                  .fontSize(15)
+                  .fontColor(Theme.text(this.isDark))
+                  .layoutWeight(1)
+                  .margin({ right: 10 })
+                Toggle({ type: ToggleType.Switch, isOn: this.keepBackgroundOnClose })
+                  .selectedColor(Theme.accent(this.isDark))
+                  .onChange((on: boolean) => { this.changeKeepBackgroundOnClose(on); })
+                  .accessibilityText('关闭窗口时保持后台运行')
+              }
+              .width('100%')
+              .height(46)
+              .padding({ left: 12, right: 12 })
             }
             .width('100%')
             .backgroundColor(Theme.input(this.isDark))
             .borderRadius(10)
             .padding({ top: 2, bottom: 2 })
-            this.caption('终端配色会跟随应用主题。')
+            this.caption('首次关闭窗口时会询问；之后按此设置直接执行。保持后台运行时可从系统状态栏恢复窗口。')
           } else if (this.tab === 1) {
             // ── Terminal ──
             Column() {
@@ -620,32 +648,42 @@ export struct SettingsView {
               .margin({ top: 6 })
           } else if (this.tab === 2) {
             // ── Agents (per-device) ──
-            Row() {
-              Text('设备')
-                .fontSize(15)
-                .fontColor(Theme.text(this.isDark))
+            Column() {
+              Row() {
+                Text('设备')
+                  .fontSize(15)
+                  .fontColor(Theme.text(this.isDark))
+                  .width(48)
+                  .margin({ right: 8 })
+                Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.Start }) {
+                  ForEach(this.deviceOptions, (d: ManagedDevice) => {
+                    Text(d.name)
+                      .fontSize(14)
+                      .fontColor(this.selectedDevice === d.id ?
+                        Theme.onAccent(this.isDark) : Theme.text(this.isDark))
+                      .backgroundColor(this.selectedDevice === d.id ?
+                        Theme.accent(this.isDark) : Theme.button(this.isDark))
+                      .borderRadius(13)
+                      .padding({ left: 14, right: 14, top: 6, bottom: 6 })
+                      .margin({ right: 6, top: 2, bottom: 2 })
+                      .onClick(() => {
+                        this.selectedDevice = d.id;
+                        this.loadDrafts();
+                        this.loadCustomAgents();
+                      })
+                      .accessibilityText('设备 ' + d.name)
+                      .accessibilitySelected(this.selectedDevice === d.id)
+                  }, (d: ManagedDevice) => d.id)
+                }
                 .layoutWeight(1)
-                .margin({ right: 10 })
-              Flex({ wrap: FlexWrap.Wrap, justifyContent: FlexAlign.End }) {
-                ForEach(this.deviceOptions, (d: ManagedDevice) => {
-                  Text(d.name)
-                    .fontSize(14)
-                    .fontColor(this.selectedDevice === d.id ? Theme.onAccent(this.isDark) : Theme.text(this.isDark))
-                    .backgroundColor(this.selectedDevice === d.id ? Theme.accent(this.isDark) : Theme.input(this.isDark))
-                    .borderRadius(13)
-                    .padding({ left: 14, right: 14, top: 6, bottom: 6 })
-                    .margin({ left: 6 })
-                    .onClick(() => {
-                      this.selectedDevice = d.id;
-                      this.loadDrafts();
-                      this.loadCustomAgents();
-                    })
-                }, (d: ManagedDevice) => d.id)
               }
+              .width('100%')
+              .alignItems(VerticalAlign.Center)
+              .padding({ left: 12, right: 8, top: 6, bottom: 6 })
             }
             .width('100%')
-            .height(46)
-            .padding({ left: 12, right: 12 })
+            .backgroundColor(Theme.input(this.isDark))
+            .borderRadius(10)
             .margin({ bottom: 8 })
 
             Column() {

@@ -60,12 +60,14 @@ export struct SidebarView {
   @Prop sidebarWidth: number = 280;
   @Link sessions: TerminalSession[];
   @Link currentId: number;
+  @Prop splitSessionUid: number = -1;
   onNewAgent: () => void = () => {};
   onNewAgentIn: (cwd: string, deviceId: string) => void = () => {};
   onSelectSpace: (deviceId: string, cwd: string) => void = () => {};
   onCloseSpace: (cwd: string, deviceId: string) => void = () => {};
   onNewSpace: () => void = () => {};
   onSearch: () => void = () => {};
+  onSplit: () => void = () => {};
   onCloseSession: (s: TerminalSession) => void = () => {};
   /** Selection by uid so Index resolves against its fresh session array. */
   onSelectSession: (uid: number) => void = () => {};
@@ -320,6 +322,8 @@ export struct SidebarView {
   }
 
   private agents(source: TerminalSession[]): TerminalSession[] {
+    // SessionManager keeps entries in creation order. Filtering preserves
+    // that stable launch-time order so state transitions never move a row.
     return source.filter((session: TerminalSession) =>
       session.cmd.length > 0 && this.matchesDevice(session) &&
       (this.selectedSpace.length === 0 || this.sessionSpaceKey(session) === this.selectedSpace));
@@ -348,6 +352,18 @@ export struct SidebarView {
     } catch (error) {
       console.error('TERMINAI focus rename input failed: ' + JSON.stringify(error));
     }
+  }
+
+  private commitRename(session: TerminalSession): void {
+    if (this.renamingUid !== session.uid) {
+      return;
+    }
+    const value = this.renameText.trim();
+    if (value.length > 0 && value !== session.name) {
+      this.onRenameSession(session, value);
+    }
+    this.renamingUid = -1;
+    this.renameInputHovered = false;
   }
 
   private menuSession(): TerminalSession | null {
@@ -830,6 +846,17 @@ export struct SidebarView {
           .backgroundColor(Theme.input(this.isDark))
           .borderRadius(6)
           Blank()
+          if (item.uid === this.splitSessionUid) {
+            Text('分屏中')
+              .fontSize(9.5)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(this.accentOf())
+              .height(18)
+              .padding({ left: 5, right: 5 })
+              .backgroundColor(Theme.accentWash(this.isDark))
+              .borderRadius(5)
+              .margin({ left: 4 })
+          }
           if (item.unread) {
             Circle({ width: 6, height: 6 })
               .fill(this.accentOf())
@@ -904,14 +931,10 @@ export struct SidebarView {
         if (isVisible) this.focusRenameInput(item);
       })
       .onSubmit(() => {
-        if (this.renameText.trim().length > 0) {
-          this.onRenameSession(item, this.renameText.trim());
-        }
-        this.renamingUid = -1;
+        this.commitRename(item);
       })
       .onBlur(() => {
-        this.renamingUid = -1;
-        this.renameInputHovered = false;
+        this.commitRename(item);
       })
   }
 
@@ -1063,6 +1086,8 @@ export struct SidebarView {
           () => { this.onNewAgent(); })
         this.actionRow(IconName.Search, 'search', '搜索', 'Ctrl + K',
           () => { this.onSearch(); })
+        this.actionRow(IconName.Split, 'split', '垂直分屏', 'Ctrl + Alt + D',
+          () => { this.onSplit(); })
       }
       .width('100%')
       .padding({ left: 10, right: 10, top: 0, bottom: 6 })
